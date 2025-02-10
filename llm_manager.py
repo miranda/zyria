@@ -30,106 +30,99 @@ class LLMManager:
 			n_threads=llm_threads,
 			n_ctx=llm_context_tokens
 		)
-		self.response_callback = response_callback	# Store callback function
-		# Set a maxsize of 100 for our priority queue.
+		self.response_callback = response_callback
 		self.queue = queue.PriorityQueue(maxsize=100)
 		self.lock = threading.Lock()
+		self.bot_last_speak_time = {}  # Tracks last message time for each bot
 		self.worker_thread = threading.Thread(target=self.process_queue, daemon=True)
 		self.worker_thread.start()
 
 	def queue_request(self, request_payload):
-		"""
-		Queues a request for the LLM.
-		
-		If the queue is full (100 items), it removes all requests with the worst (i.e. highest
-		numerical) priority from the queue (calling the callback for each with a 'purged' result).
-		If the new request itself is not better than what is already in the queue, it is dropped.
-		"""
+		"""Queues a request and schedules its processing to prevent bots from speaking at the same time."""
 		priority = request_payload["priority"]
 		request_id = request_payload["request_id"]
 		prompt_data = request_payload["prompt_data"]
-		debug_print(f"Queueing request {request_id}, Priority: {priority}, Other Names: {prompt_data.get('other_names', [])}", color="green")
+
+		# ✅ Handle ignored requests immediately and return
+		if prompt_data.get("ignored", False):
+			logger.debug(f"LLMManager: Request {request_id} ignored. Returning empty response immediately.")
+			ignored_response = {
+				"text": "",
+				"finish_reason": "stop",
+				"prompt_tokens": 0,
+				"completion_tokens": 0,
+			}
+			self.response_callback(request_id, ignored_response)
+			return	# ✅ Do not add ignored requests to the queue
+
+		bot_name = prompt_data["speaker"]  # Get the bot name
 
 		with self.lock:
-			# If the queue is full, purge lowest priority requests.
-			if self.queue.qsize() >= self.queue.maxsize:
-				# Get a reference to the underlying list (this is not thread‐safe in general,
-				# but we have the lock here).
-				current_items = list(self.queue.queue)
-				# Determine the worst (i.e. highest) priority in the queue.
-				worst_priority = max(item[0] for item in current_items)
-				# Decide whether the new request is good enough:
-				if priority < worst_priority:
-					# New request is of higher importance. Purge all items with the worst priority.
-					purge_candidates = [item for item in current_items if item[0] == worst_priority]
-					for item in purge_candidates:
-						try:
-							self.queue.queue.remove(item)
-							# Inform the queue that the task is done.
-							self.queue.task_done()
-							_, purged_request_id, _ = item
-							logger.debug(f"LLMManager: Purging request {purged_request_id} (priority {item[0]})")
-							# Call the callback with a special result for purged requests.
-							self.response_callback(
-								purged_request_id,
-								{
-									"text": "",
-									"finish_reason": "purged",
-									"prompt_tokens": 0,
-									"completion_tokens": 0,
-								},
-							)
-						except ValueError:
-							pass  # item was already removed somehow
-					# After manual removals, fix the heap invariant.
-					heapq.heapify(self.queue.queue)
-				else:
-					# New request is not better than any existing request, so drop it.
-					logger.debug(f"LLMManager: Dropping request {request_id} (priority {priority}) because queue is full")
-					self.response_callback(
-						request_id,
-						{
-							"text": "",
-							"finish_reason": "dropped",
-							"prompt_tokens": 0,
-							"completion_tokens": 0,
-						},
-					)
-					return	# do not add this request
+			now = time.time()
+			last_speak_time = self.bot_last_speak_time.get(bot_name, now)
 
-			# Now we can add the new request.
-			self.queue.put((priority, request_id, prompt_data))
+			# Calculate delay (minimum of 3 sec, +2 sec for each stacked request)
+			base_delay = 3
+			additional_delay = 2 * sum(1 for _, _, _, p in self.queue.queue if p["speaker"] == bot_name)
+			next_speak_time = max(now, last_speak_time) + base_delay + additional_delay
+
+			self.bot_last_speak_time[bot_name] = next_speak_time  # Update last speak time
+
+			debug_print(f"Scheduling {bot_name} to speak in {next_speak_time - now:.2f}s", color="cyan")
+
+			# Schedule the message at the correct time
+			heapq.heappush(self.queue.queue, (next_speak_time, priority, request_id, prompt_data))
 
 	def process_queue(self):
-		"""Processes the queue, sending requests to the LLM"""
+		"""Processes the queue, sending requests to the LLM when their scheduled time arrives."""
 		while True:
-			try:
-				priority, request_id, prompt_data = self.queue.get()
-				debug_print(f"Processing request {request_id}, Other Names: {prompt_data.get('other_names', [])}", color="yellow")
-				
-				# Check if the request is ignored (prompt_data contains 'ignored')
-				if prompt_data.get("ignored", False):
-					logger.debug(f"LLMManager: Request {request_id} ignored. Returning empty response.")
-					ignored_response = { 
-						"text": "",	 # Send an empty response
-						"finish_reason": "stop",
-						"prompt_tokens": 0,
-						"completion_tokens": 0,
-					}
-					self.response_callback(request_id, ignored_response)
-					self.queue.task_done()	# ✅ Mark task as completed
-					continue  # ✅ Skip LLM call
+			with self.lock:
+				if not self.queue.queue:
+					time.sleep(0.1)
+					continue
 
-				# Normal processing
-				result = self.call_llm(prompt_data)
-				self.response_callback(request_id, result)
+				now = time.time()
+				next_speak_time, priority, request_id, prompt_data = self.queue.queue[0]
 
-				# ✅ Mark task as completed
-				self.queue.task_done()
+				if now >= next_speak_time:
+					heapq.heappop(self.queue.queue)	 # Remove from queue
+					
+					debug_print(f"{prompt_data['speaker']} speaking now: {prompt_data['prompt']}", color="green")
 
-			except Exception as e:
-				logger.error(f"LLMManager: Error processing queue - {e}")
-				logger.error(traceback.format_exc())  # ✅ Print full stack trace
+					# Call the LLM and return the result
+					result = self.call_llm(prompt_data)
+					self.response_callback(request_id, result)
+
+			time.sleep(0.1)	 # Prevent CPU overload
+
+	def call_llm(self, prompt_data):
+		"""Generates a response from the LLM"""
+		try:
+			result = self.model(prompt=prompt_data["prompt"], max_tokens=llm_max_tokens)
+
+			# Extract response text
+			result_text = result['choices'][0]['text'] if 'choices' in result and len(result['choices']) > 0 else ""
+			debug_print(f"LLMManager: Generated text - {result_text}", color="none")
+
+			return {
+				"text": result_text,
+				"finish_reason": result["choices"][0].get("finish_reason", "unknown"),
+				"prompt_tokens": result.get("usage", {}).get("prompt_tokens", 0),
+				"completion_tokens": result.get("usage", {}).get("completion_tokens", 0),
+			}
+
+		except Exception as e:
+			logger.error(f"LLMManager: Error calling LLM - {e}")
+			return {
+				"text": "",
+				"finish_reason": "error",
+				"prompt_tokens": 0,
+				"completion_tokens": 0,
+			}
+
+	def get_scheduling_offset(self, bot_name):
+		"""Returns the total scheduling delay for a bot."""
+		return sum(2 for item in self.queue.queue if isinstance(item, tuple) and len(item) == 3 and isinstance(item[2], dict) and item[2].get("speaker") == bot_name)
 
 	def call_llm(self, prompt_data):
 		"""Generates a response from the LLM"""
@@ -260,7 +253,7 @@ class LLMManager:
 			return ""
 
 		# Abort if talking about self in 3rd person
-		pattern = rf"^{re.escape(speaker_lower)}\b.*"
+		pattern = rf"^[\W\s]*{re.escape(speaker_lower)}[\W\s]+.*"
 		if re.match(pattern, result.lower()):
 			logger.debug(f"filter_text: '{speaker} is talking about self in 3rd person. Discarding.")
 			return ""
@@ -328,16 +321,21 @@ class LLMManager:
 		return text
 
 	def clean_single_quotes(self, text):
-		# 1) Preserve single quotes between letters by replacing them with a placeholder.
-		#	 For example, "Don’t" => "Don###QUOTE###t"
-		preserved = re.sub(r"([A-Za-z])'([A-Za-z])", r"\1###QUOTE###\2", text)
-		
-		# 2) Strip out all remaining single quotes (those not between letters).
-		no_extras = preserved.replace("'", "")
-		
-		# 3) Put back the placeholder as a single quote.
+		debug_print(f"clean_single_quotes - Before: {text}", color="red")
+
+		# Normalize curly apostrophes (’ -> ')
+		text = text.replace("’", "'")
+
+		# 1) Preserve single quotes **inside words** (e.g., "don't" stays intact)
+		preserved = re.sub(r"(\b\w+)'(\w+\b)", r"\1###QUOTE###\2", text)
+
+		# 2) Strip out all remaining single quotes
+		no_extras = re.sub(r"'", "", preserved)
+
+		# 3) Restore **preserved** quotes back into words
 		result = no_extras.replace("###QUOTE###", "'")
-		
+
+		debug_print(f"clean_single_quotes - After: {result}", color="red")
 		return result
 
 	def correct_misspelled_names(self, text, known_names, threshold=80, min_length=0.8):

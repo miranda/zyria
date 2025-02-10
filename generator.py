@@ -12,6 +12,7 @@ generator_bot_reply_chance			= int(config.get('Generator', 'BotToBotReplyChance'
 generator_expansions				= config.get('Generator', 'Expansions').split(', ')
 generator_prompt_reply				= config.get('Generator', 'PromptReply')
 generator_prompt_new				= config.get('Generator', 'PromptNew')
+generator_prompt_continue			= config.get('Generator', 'PromptContinue')
 generator_prompt_rpg				= config.get('Generator', 'PromptRpg')
 generator_prompt_location			= config.get('Generator', 'PromptLocation')
 generator_prompt_location_party		= config.get('Generator', 'PromptLocationParty')
@@ -157,7 +158,6 @@ class Generator:
 
 	def dynamic_generate(self, data, request_id) -> dict:
 		request_time	= data.get("request_time", time.time())
-		thinking_delay	= data.get("delay", 0)
 
 		sender_type		= data.get("sender", {})
 		message_type	= data.get("message_type", {})
@@ -224,7 +224,10 @@ class Generator:
 		directed_names, mentioned_names = [], []
 		speaking_prompt = ""
 
-		process_timestamp = request_time + thinking_delay
+		scheduling_offset = self.llm_manager.get_scheduling_offset(bot_name)
+		process_timestamp = request_time + scheduling_offset
+		debug_print(f"Message from {other_name} for {bot_name} \"{message}\" has scheduling offset of {scheduling_offset}", color="yellow") 
+
 		command_response = self.process_command(bot_name, message)	# Process commands
 		if not command_response and message_type == "reply":
 			directed_names, mentioned_names = self.is_speaking_to_you(
@@ -269,7 +272,11 @@ class Generator:
 		format_data["environment"] = environment.format_map(DefaultDict(format_data))
 
 		# Choose the appropriate base prompt
-		prompt = generator_prompt_new if message_type == "new" else generator_prompt_reply
+		if message_type == "new":
+			prompt = generator_prompt_continue if context else generator_prompt_new
+		else:
+			prompt = generator_prompt_reply
+
 		prompt = prompt.format_map(DefaultDict(format_data))
 
 		# Get personality if available
@@ -289,9 +296,12 @@ class Generator:
 		if message_type == "reply" and self.should_ignore_message(filtered_message, bot_name, directed_names, mentioned_names):
 			debug_print(f"Generator: ignored {message_type} message '{message}' from {other_name} to {bot_name}.", color="yellow")
 			ignored_payload = {
-				"prompt_data": {"ignored": True},	# ✅ Mark request as ignored
+				"prompt_data": {
+					"ignored": True,
+					"speaker": "None"  # ✅ Add a dummy speaker to prevent KeyError
+				},
 				"request_id": request_id,
-				"priority": 0,	# Highest priority (remove from queue ASAP)
+				"priority": 0,  # Highest priority (remove from queue ASAP)
 			}
 			self.llm_manager.queue_request(ignored_payload)
 			return	# Exit early

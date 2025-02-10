@@ -42,7 +42,6 @@ def generate_request():
 
 	request_id = str(time.time())  # Unique ID for tracking
 	pending_requests[request_id] = Queue()	# Create queue for waiting response
-	thinking_delay = 0
 
 	# Check if request is for standard or dynamic prompt generation
 	if "prompt" in data:
@@ -50,15 +49,11 @@ def generate_request():
 	else:
 		message_type = data.get("message_type", {})
 		if message_type == "rpg":
+			debug_print("Server calling rpg_generate in generator.py", color="red")
 			generator.rpg_generate(data, request_id)  # Same here
 		else:
 			# Add timestamp to track when the request was queued
 			data["request_time"] = time.time()
-
-			# Simulate thinking delay
-			thinking_delay = random.uniform(4, 10)  # Random delay
-			data["delay"] = thinking_delay
-
 			generator.dynamic_generate(data, request_id)  # Same here
 
 	# Wait for response from llm_manager (non-blocking)
@@ -66,7 +61,6 @@ def generate_request():
 		response = pending_requests[request_id].get(timeout=60)	 # Wait max 60s
 		del pending_requests[request_id]  # Clean up tracking
 
-		time.sleep(thinking_delay)
 		json_response = json.dumps(response)
 		debug_print(f"Server: sending to json to MaNGOS - {json_response}")
 		return jsonify(response)
