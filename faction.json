@@ -1,0 +1,12 @@
+{
+  "Human": "Alliance",
+  "Dwarf": "Alliance",
+  "Night Elf": "Alliance",
+  "Gnome": "Alliance",
+  "Draenei": "Alliance",
+  "Orc": "Horde",
+  "Undead": "Horde",
+  "Tauren": "Horde",
+  "Troll": "Horde",
+  "Blood Elf": "Horde"
+}

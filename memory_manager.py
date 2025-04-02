@@ -1,13 +1,9 @@
-import configparser
-import os, json, logging
+import os
+import json
+import re
 import tempfile
-import logging
 from log_utils import debug_print, logger
-
-config = configparser.ConfigParser()
-config.read('zyria.conf')
-
-memory_dir = config.get('Memory Manager', 'MemoryDir', fallback='memory')
+import threading
 
 def atomic_save(memory_file, data):
 	# Write data to a temporary file first.
@@ -19,40 +15,54 @@ def atomic_save(memory_file, data):
 	os.replace(temp_name, memory_file)
 
 class MemoryManager:
-	def __init__(self):
-		self.memory_dir = memory_dir
+	def __init__(self, config, llm_manager):
+		self.llm_manager = llm_manager
+
+		self.memory_dir = config.get('Memory Manager', 'MemoryDir', fallback='memory')
 		os.makedirs(self.memory_dir, exist_ok=True)
+
 		self.memories = {}
+		self.lock = threading.RLock()  # 🔒 Lock for thread safety
 
-	def load_memory(self, bot_name):
-		if bot_name not in self.memories:
-			memory_file = os.path.join(self.memory_dir, f"{bot_name}.json")
-			try:
-				with open(memory_file, "r", encoding="utf-8") as f:
-					content = f.read().strip()
-					if not content:
-						raise json.JSONDecodeError("Empty file", content, 0)
-					self.memories[bot_name] = json.loads(content)
-			except (FileNotFoundError, json.JSONDecodeError):
-				self.memories[bot_name] = {
-					"personality": {
-						"backstory": [],
-						"pets": [],
-						"likes": [],
-						"dislikes": []
-					},
-					"events": [],
-					"relationships": {}
-				}
-			self.save_memory(bot_name)
+		# Load the race-to-faction mapping
+		with open("faction.json", "r") as file:
+			self.race_faction_lookup = json.load(file)
 
-	def save_memory(self, bot_name):
+	def load_memory(self, name):
+		with self.lock:	 # 🔒 Prevent concurrent read/write
+			if name not in self.memories:
+				memory_file = os.path.join(self.memory_dir, f"{name}.json")
+				try:
+					with open(memory_file, "r", encoding="utf-8") as f:
+						content = f.read().strip()
+						if not content:
+							raise json.JSONDecodeError("Empty file", content, 0)
+						self.memories[name] = json.loads(content)
+				except (FileNotFoundError, json.JSONDecodeError):
+					self.memories[name] = {
+						"personality": {
+							"backstory": [],
+							"pets": [],
+							"likes": [],
+							"dislikes": []
+						},
+						"events": [],
+						"relationships": {}
+					}
+
+				if not "character" in self.memories[name]:
+					self.memories[name]["character"] = {}
+				
+				self.save_memory(name)
+
+	def save_memory(self, name):
 		"""Save memory to a file."""
-		memory_file = os.path.join(self.memory_dir, f"{bot_name}.json")
-		if bot_name in self.memories:
-			atomic_save(memory_file, self.memories[bot_name])
+		with self.lock:	 # 🔒 Ensure only one save happens at a time
+			memory_file = os.path.join(self.memory_dir, f"{name}.json")
+			if name in self.memories:
+				atomic_save(memory_file, self.memories[name])
 
-	def handle_memory_command(self, bot_name, command_type, command_body):
+	def handle_memory_command(self, name, command_type, command_body):
 		"""
 		Routes memory commands to the correct function.
 		- "remember" -> `remember()`
@@ -61,15 +71,15 @@ class MemoryManager:
 		"""
 
 		if command_type == "remember":
-			return self.process_remember_command(bot_name, command_body)
+			return self.process_remember_command(name, command_body)
 		elif command_type == "forget":
-			return self.process_forget_command(bot_name, command_body)
+			return self.process_forget_command(name, command_body)
 		elif command_type == "list":
-			return self.list_memories(bot_name, command_body)
+			return self.list_memories(name, command_body)
 
 		return "I don't understand that memory command."  # Should never reach this
 
-	def process_remember_command(self, bot_name, command_body):
+	def process_remember_command(self, name, command_body):
 		"""
 		Extracts the correct category and adds a new memory.
 		"""
@@ -90,12 +100,12 @@ class MemoryManager:
 				response_template = details[1]
 				relation = details[2] if len(details) > 2 else None
 
-				self.remember(bot_name, category, content, relation)
+				self.remember(name, category, content, relation)
 				return response_template.format(content)
 
 		return "I don't understand that memory command."
 
-	def process_forget_command(self, bot_name, command_body):
+	def process_forget_command(self, name, command_body):
 		"""
 		Parses the forget command and removes the memory.
 		Example: "forget: pet luna" will remove "Luna" from pets.
@@ -114,14 +124,14 @@ class MemoryManager:
 			if match:
 				content = match.group(1).strip().capitalize()
 
-				if self.forget(bot_name, category, content):
+				if self.forget(name, category, content):
 					return f"Memory removed: {content} from {category}."
 				else:
 					return f"I couldn't find {content} in {category}."
 
 		return "I don't understand that forget command."
 
-	def list_memories(self, bot_name, command_body):
+	def list_memories(self, name, command_body):
 		"""
 		Lists memory in a given category.
 		Example: "list: pets" returns all pets.
@@ -141,32 +151,162 @@ class MemoryManager:
 
 		# Retrieve memory
 		if category in ["friend", "rival"]:
-			data = self.memories.get(bot_name, {}).get("relationships", {}).get(category, [])
+			data = self.memories.get(name, {}).get("relationships", {}).get(category, [])
 		else:
-			data = self.memories.get(bot_name, {}).get("personality", {}).get(category, [])
+			data = self.memories.get(name, {}).get("personality", {}).get(category, [])
 
 		if not data:
 			return f"I don't have any {category} saved."
 
 		return f"{valid_categories[category]}: {', '.join(data)}."
 
-	def update_personality(self, bot_name, key, value):
-		"""Update personality traits."""
-		self.load_memory(bot_name)
-		if key in self.memories[bot_name]["personality"]:
-			if isinstance(self.memories[bot_name]["personality"][key], list):
-				self.memories[bot_name]["personality"][key].append(value)
+	def get_character_info(self, name):
+		"""Retrieve character info."""
+		with self.lock:
+			self.load_memory(name)
+			return self.memories[name]["character"]
+
+	def get_player_status(self, name, member_names):
+		"""Determine if a player is present in the chat."""
+		return "currently in the chat" if name in member_names else "not present or offline"
+
+	def replace_placeholders(self, text, member_names):
+		"""
+		Replace {player_info} and {player_status} placeholders in memory text.
+		"""
+		# Match placeholders in the text
+		matches = re.findall(r"(\w+) (\{player_info\}|\{player_status\})", text)
+
+		for char_name, placeholder in matches:
+			status = self.get_player_status(char_name, member_names)
+			if placeholder == "{player_info}":
+				char_info = self.get_character_info(char_name)	# Returns a dict
+
+				# 🔹 Ensure all required fields exist before formatting
+				if all(k in char_info for k in ["gender", "race", "spec", "class"]):
+					char_info_str = (
+						f"{char_name} ({char_info['gender']} {char_info['race']} {char_info['spec']} {char_info['class']} - {status})"
+					)
+				else:
+					char_info_str = char_name  # ✅ Keep the name but remove `{player_info}`
+
+				text = text.replace(f"{char_name} {placeholder}", char_info_str)
+
+			elif placeholder == "{player_status}":
+				text = text.replace(f"{char_name} {placeholder}", f"{char_name} ({status})")
+				text = re.sub(r'\s+', ' ', text).strip() 
+		return text
+
+	def get_processed_memory(self, name, member_names):
+		"""Retrieve memory with placeholders replaced."""
+		with self.lock:
+			self.load_memory(name)
+			memory = self.memories[name]
+
+			# Process placeholders in all string fields
+			def process_data(data):
+				if isinstance(data, str):
+					return self.replace_placeholders(data, member_names)
+				elif isinstance(data, list):
+					return [process_data(item) for item in data]
+				elif isinstance(data, dict):
+					return {key: process_data(value) for key, value in data.items()}
+				return data
+
+			return process_data(memory)
+
+	def update_character_info(self, name, **kwargs):
+		"""Completely replace the 'character' dictionary, ensuring it exists and removing missing keys."""
+		with self.lock:
+			self.load_memory(name)
+
+			# Replace 'character' with a new dictionary containing only kwargs
+			self.memories[name]["character"] = {key: value for key, value in kwargs.items() if key != "name"}
+
+			debug_print(f"Replacing {name}'s character data with {self.memories[name]['character']}", color="blue")
+
+			self.save_memory(name)
+
+	def get_formatted_character_info(self, name, member_names, basic=False, location=False, show_personality=False):
+		with self.lock:
+			self.load_memory(name)
+			character = self.memories[name]["character"]
+			text = name
+
+			if "level" in character:
+				if basic:
+					text += (
+						f" - {character.get('gender', '')} "
+						f"{character.get('race', '')} "
+						f"{character.get('class', '')}"
+					)
+				else:
+					faction = self.race_faction_lookup.get(character.get("race", "Unknown"), "Unknown")
+					text += (
+						f" - A level {character.get('level', '??')}"
+						f" {character.get('gender', '')}"
+						f" {character.get('race', '')}"
+						f" {character.get('spec', '')}"
+						f" {character.get('class', 'Unknown')}\n"
+						f" * Faction: {faction}\n"
+						f" * Guild: {character.get('guild', 'No guild')}\n"
+					)
+
+			if show_personality and (personality := self.get_personality_formatted(name, member_names)):
+				text += personality
+
+			if location:
+				location_text = self.format_location(character.get('zone', ''), character.get('subzone', ''), character.get('continent', ''))
+				text += "** {name}'s current location is: {location}.\n" if location_text != "Unknown" else ""
+
+			return text
+
+	def update_speakers_character_info(self, speakers):
+		"""Update memory for all speakers with their character details."""
+		for speaker in speakers:
+			name = speaker.get("name")
+			if not name or name == "Unknown":
+				continue  # Skip invalid names
+			
+			# ✅ Loop through all keys in speaker and update memory
+			for key, value in speaker.items():
+				if key == "name":  # Skip updating the name itself
+					continue
+				debug_print(f"Updating {key} for {name}")
+				self.update_character_info(name, **{key: value})
+
+	def format_location(self, zone, subzone, continent):
+		parts = []
+
+		if subzone and zone and zone != "Unknown":
+			parts.append(f"{subzone}, {zone}")
+		elif zone and zone != "Unknown":
+			parts.append(zone)
+
+		if continent and continent != "Unknown":
+			if parts:
+				parts[-1] += f", in {continent}"
 			else:
-				self.memories[bot_name]["personality"][key] = value
-		self.save_memory(bot_name)
+				parts.append(continent)
 
-	def get_personality(self, bot_name):
-		"""Retrieve personality traits."""
-		self.load_memory(bot_name)
-		return self.memories[bot_name]["personality"]
+		return parts[0] if parts else ""
 
-	def get_personality_formatted(self, bot_name):
-		personality = self.get_personality(bot_name)
+	def get_personality(self, name, member_names):
+		"""Retrieve personality traits with placeholders processed."""
+		with self.lock:
+			processed_memory = self.get_processed_memory(name, member_names)
+			return processed_memory["personality"]
+
+	def get_relationships(self, name, member_names):
+		"""Retrieve personality traits with placeholders processed."""
+		with self.lock:
+			processed_memory = self.get_processed_memory(name, member_names)
+			return processed_memory["relationships"]
+
+	def get_personality_formatted(self, name, member_names):
+		personality = self.get_personality(name, member_names)
+		relationships = self.get_relationships(name, member_names)
+
 		if self.is_effectively_empty(personality):
 			return ""
 
@@ -174,29 +314,40 @@ class MemoryManager:
 		formatted = ""
 
 		if "backstory" in personality and personality["backstory"]:
-			formatted += "Backstory: "
-			formatted += ", ".join(personality["backstory"]) + " - "
+			formatted += " * Backstory: "
+			formatted += ". ".join(personality["backstory"]) + ".\n"
 
 		if "pets" in personality and personality["pets"]:
-			formatted += "Pets: "
-			formatted += ", ".join(personality["pets"]) + " - "
+			formatted += " * Pets: "
+			formatted += ", ".join(personality["pets"]) + ".\n"
 
 		if "likes" in personality and personality["likes"]:
-			formatted += "Likes: "
-			formatted += ", ".join(personality["likes"]) + " - "
+			formatted += " * Likes: "
+			formatted += ", ".join(personality["likes"]) + ".\n"
 
 		if "dislikes" in personality and personality["dislikes"]:
-			formatted += "Dislikes: "
-			formatted += ", ".join(personality["dislikes"]) + " - "
+			formatted += " * Dislikes: "
+			formatted += ", ".join(personality["dislikes"]) + ".\n"
 
 		# 🆕 Handle relationships dynamically
-		if "relationships" in personality and personality["relationships"]:
-			for relation_type, people in personality["relationships"].items():
-				if people:	# Only include if the list is not empty
-					formatted += f"{relation_type.capitalize()}: " + ", ".join(people) + " - "
+		if relationships:
+			for relation_type, people in relationships.items():
+				if people:
+					formatted += f" * {relation_type.capitalize()}: " + ", ".join(people) + "\n"
 
-		formatted = formatted.removesuffix(f" - ")
-		return formatted.strip()
+#		formatted = re.sub(r'[ \t]+', ' ', formatted).strip()
+		return formatted
+
+	def update_personality(self, name, key, value):
+		"""Update personality traits."""
+		with self.lock:
+			self.load_memory(name)
+			if key in self.memories[name]["personality"]:
+				if isinstance(self.memories[name]["personality"][key], list):
+					self.memories[name]["personality"][key].append(value)
+				else:
+					self.memories[name]["personality"][key] = value
+			self.save_memory(name)
 
 	def is_effectively_empty(self, memory):
 		if not memory:	# If the entire object is empty

@@ -1,30 +1,16 @@
-import configparser, re, regex
+import configparser
+import re
 from collections import defaultdict
-import json, time, random
+import json
+import time
 import threading
-import logging
 from log_utils import debug_print, logger
+import string
 
 config = configparser.ConfigParser()
-config.read('zyria.conf')
+config.read(['zyria.conf', 'prompts.conf'])
 
-generator_bot_reply_chance			= int(config.get('Generator', 'BotToBotReplyChance', fallback='50'))
-generator_expansions				= config.get('Generator', 'Expansions').split(', ')
-generator_prompt_reply				= config.get('Generator', 'PromptReply')
-generator_prompt_new				= config.get('Generator', 'PromptNew')
-generator_prompt_continue			= config.get('Generator', 'PromptContinue')
-generator_prompt_rpg				= config.get('Generator', 'PromptRpg')
-generator_prompt_location			= config.get('Generator', 'PromptLocation')
-generator_prompt_location_party		= config.get('Generator', 'PromptLocationParty')
-generator_prompt_location_nearby	= config.get('Generator', 'PromptLocationNearby')
-generator_prompt_location_apart		= config.get('Generator', 'PromptLocationApart')
-generator_prompt_channel			= config.get('Generator', 'PromptChannel')
-generator_prompt_speaking_to		= config.get('Generator', 'PromptSpeakingTo')
-generator_prompt_mentioned			= config.get('Generator', 'PromptMentioned')
-generator_prompt_context			= config.get('Generator', 'PromptContext')
-generator_max_tokens				= int(config.get('Generator', 'MaxTokens', fallback='50'))
-generator_max_group_size			= int(config.get('Generator', 'MaxGroupSize', fallback='5'))
-generator_attention_timeout			= int(config.get('Generator', 'AttentionTimeout', fallback='10'))
+ATTENTION_TIMEOUT = 10	# seconds
 
 def load_class_overrides():
 	"""Loads class overrides from a JSON file."""
@@ -37,466 +23,371 @@ def load_class_overrides():
 		logger.error(f"Error loading class_overrides.json: {e}")
 		return {}  # Return empty if JSON is corrupted
 
-class DefaultDict(dict):
+def get_placeholders(template):
+	return [field_name for _, field_name, _, _ in string.Formatter().parse(template) if field_name]
+
+def render_template(template, data):
+	required = get_placeholders(template)
+	used = {k: data.get(k, "") for k in required}
+	return template.format_map(SafeDict(used))
+
+class SafeDict(dict):
 	def __missing__(self, key):
-		return f"{{{key}}}"	 # Keeps the placeholder as `{key}`
+		return f"{{{key}}}"	 # Leaves placeholder as-is if missing
 
 class Generator:
-	def __init__(self, memory_manager, llm_manager):
+	def __init__(self, config, *, prompt_builder, conversation_manager, memory_manager, npc_manager, context_manager, llm_manager, attention_manager):
+		self.config = config
+		self.prompt_builder = prompt_builder
+		self.conversation_manager = conversation_manager
 		self.memory_manager = memory_manager
+		self.npc_manager = npc_manager
+		self.context_manager = context_manager
 		self.llm_manager = llm_manager
+		self.attention_manager = attention_manager
 
-		# Attention state: bot_name -> {player: str, timestamp: float}
-		self.attention_state = defaultdict(dict)
-		self.attention_lock = threading.Lock()	# Prevents modification conflicts
+		self.batch_cycle_time = float(config.get('Generator', 'BatchCycleTime', fallback='4.0'))
 
 		# Load class overrides
 		self.class_overrides = load_class_overrides()
 
-	def send_to_llm(self, prompt, speaker, other_names, context, priority, request_id):
-		debug_print(f"send_to_llm received other_names: {other_names}", color="yellow")
+		# ✅ Regular Channel Processing Threads
+		self.channel_threads = {}
+
+		# ✅ Separate RPG Processing Thread
+		self.rpg_processing_thread = threading.Thread(target=self.rpg_generator_loop, daemon=True)
+		self.rpg_processing_thread.start()
+
+	def process_or_start(self, llm_channel):
+		if llm_channel.startswith("RPG"):
+			# RPG threads are handled separately, do not spawn normal generator threads
+			return
+
+		if llm_channel not in self.channel_threads:
+			t = threading.Thread(target=self.generator_loop, args=(llm_channel,), daemon=True)
+			self.channel_threads[llm_channel] = t
+			t.start()
+			debug_print(f"Started generator_loop() thread for channel {llm_channel}", color="green")
+
+	def generator_loop(self, llm_channel):
+		while True:
+			requests, message_type = self.conversation_manager.fetch_pending_requests(llm_channel)
+			if not requests:
+				time.sleep(0.5)	 # Short nap to avoid busy loop
+				continue
+
+			with self.conversation_manager.queues_lock:
+				for request in requests:
+					request["status"] = "processing"
+
+			if message_type == "new":
+				debug_print(f"Processing 'new' message immediately in channel {llm_channel}", color="blue")
+				self.batch_generate(requests)
+				continue
+
+			# Only stall this channel while waiting for more
+			wait_time = max(self.batch_cycle_time - len(requests), 1.0)
+			time.sleep(wait_time)
+
+			more_requests, more_message_type = self.conversation_manager.fetch_pending_requests(
+				llm_channel
+			)
+
+			if more_requests:
+				with self.conversation_manager.queues_lock:
+					for request in more_requests:
+						request["status"] = "processing"
+					requests.extend(more_requests)
+
+			self.batch_generate(requests)
+
+	def rpg_generator_loop(self):
+		"""Continuously fetches and processes RPG requests every 1 second."""
+		while True:
+			for llm_channel in self.conversation_manager.get_active_channels():
+				if not llm_channel.startswith("RPG"):
+					continue  # ✅ Skip non-RPG channels
+
+				requests, message_type = self.conversation_manager.fetch_pending_rpg_requests(llm_channel)
+				if requests:
+					if len(requests) == 1:
+						requests[0]["status"] = "processing"
+
+						debug_print(f"Processing RPG request {requests[0]['request_id']}", color="cyan")
+						self.rpg_generate(requests)
+					else:
+						logger.error("❌ ERROR: Attempted to process more than one RPG request simultaneously.")
+
+			time.sleep(1.5)	 # ✅ Poll RPG channels every 1.5 seconds
+
+	def extract_details(self, entity_data, entity_type="player"):
+		""" Extracts common entity attributes, adding extra fields for players and NPCs. """
+
+		name = entity_data.get("name", "Unknown")
+
+		# ✅ Apply class overrides if the entity is a player/bot
+		if entity_type == "player" and name in self.class_overrides:
+			override_class = self.class_overrides[name]
+			debug_print(f"Player <{name}> found in class overrides, changing class to {override_class}", color="dark_yellow")
+			entity_class = override_class
+		else:
+			entity_class = entity_data.get("class", "Unknown")
+
+		data = {
+			"type": entity_data.get("type", "Unknown"),
+			"name": name,
+			"gender": entity_data.get("gender", "Unknown"),
+			"level": entity_data.get("level", "Unknown"),
+			"class": entity_class
+		}
+
+		if entity_type == "player":	 # Players/bots
+			data.update({
+				"race": entity_data.get("race", "Unknown"),
+				"spec": entity_data.get("spec", ""),
+				"guild": entity_data.get("guild", "No Guild"),
+				"zone": entity_data.get("zone", "Unknown"),
+				"subzone": entity_data.get("subzone", ""),
+				"continent": entity_data.get("continent", "Unknown")
+			})
+
+		elif entity_type == "npc":	# NPCs have faction and creature type instead
+			faction = entity_data.get("faction", "")
+			faction = re.sub(r" generic$", "", faction)	 # Remove "generic"
+			faction = "" if re.match(r"^PLAYER, ", faction) else faction	
+			data.update({
+				"faction": faction,
+				"creature_type": entity_data.get("creature_type", "Unknown"),
+				"creature_subname": entity_data.get("sub_name", "")
+			})
+
+		return data
+
+	def batch_generate(self, requests_list):
+		"""Generates reply responses for a batch of bot messages"""
+		debug_print(f"batch_generate() called with request IDs {[r.get('request_id') for r in requests_list]}", color="cyan")
+
+		if not requests_list:
+			logger.warning("batch_generate received an empty request list.")
+			return []
+
+		# ✅ Extract first request details (assuming all requests in batch share context)
+		first_request = requests_list[0]
+		message_type = first_request.get("message_type", "unknown")
+		expansion = first_request.get("expansion", 1)  # Default to TBC
+		channel_members = first_request.get("channel_members", {})
+		llm_channel = first_request.get("llm_channel", None)
+		channel_label = first_request.get("channel_label", None)
+		member_names = list(channel_members.keys())
+
+		# Update channel members
+		self.context_manager.update_channel_members(llm_channel, member_names)
+
+		# ✅ Initialize response mappings
+		request_speaker_map = {}  # {request_id -> speaker_name}
+		new_messages = set()	 # ✅ Use a set to track unique (sender, message) pairs
+		updated_characters = set()	# ✅ Track characters that have already been updated
+		attention_prompt_data = defaultdict(list)  # sender_name -> list of speaker_names
+
+		# ✅ Unique collector helpers
+		unique_senders = {}
+		unique_speakers = {}
+
+		# ✅ Process all requests
+		for request in requests_list:
+			request_id = request.get("request_id", None)
+			message = request.get("message", None)
+			sender = request.get("sender", None)
+			speaker = request.get("speaker", {})
+
+			if not request_id or not message or not sender or not speaker:
+				logger.warning(f"Skipping malformed request: {request}")
+				continue
+
+			# ✅ Extract sender details
+			sender_data = self.extract_details(sender)
+			sender_type = sender_data.get("type", "Unknown")
+			sender_update = sender_data.copy()
+			sender_name = sender_update.pop("name")
+
+			# ✅ Update sender if needed
+			if sender_name not in updated_characters:
+				self.memory_manager.update_character_info(sender_name, **sender_update)
+				updated_characters.add(sender_name)
+
+			# ✅ Store sender uniquely
+			unique_senders[sender_name] = sender_data
+
+			# ✅ Extract speaker details
+			speaker_data = self.extract_details(speaker)
+			speaker_update = speaker_data.copy()
+			speaker_name = speaker_update.pop("name")
+
+			# ✅ If the speaker already has a request, cancel the previous one
+			if message_type == "reply":
+				for prev_request_id, prev_speaker_name in list(request_speaker_map.items()):
+					if prev_speaker_name == speaker_name:
+						del request_speaker_map[prev_request_id]
+						debug_print(f"Cancelling previous redundant request {request_id} for <{speaker_name}>", color="dark_cyan")
+						self.conversation_manager.cancel_request(prev_request_id, speaker_name, llm_channel)
+						break
+
+			ignore_votes = []
+			for sender_data_entry in unique_senders.values():
+				s_name = sender_data_entry["name"]
+				s_type = sender_data_entry.get("type", "Unknown")
+
+				should_ignore, prompt_attention = self.attention_manager.get_message_attention_data(
+					s_name, speaker_name, member_names, message, llm_channel
+				)
+
+				if s_type == "player" and prompt_attention:
+					attention_prompt_data[s_name].append(speaker_name)
+
+				ignore_votes.append(should_ignore)
+
+			if all(ignore_votes):
+				debug_print(f"Speaker <{speaker_name}> cancelled due to attention check (ignored by all senders)", color="cyan")
+				self.conversation_manager.cancel_request(request_id, speaker_name, llm_channel, release=True)
+				continue
+
+			# ✅ Store speaker uniquely
+			unique_speakers[speaker_name] = speaker_data
+
+			# ✅ Track request to speaker
+			request_speaker_map[request_id] = speaker_name
+
+			if speaker_name not in updated_characters:
+				self.memory_manager.update_character_info(speaker_name, **speaker_update)
+				updated_characters.add(speaker_name)
+
+			# ✅ Track sender-message pair
+			if message_type == "reply":
+				targets = tuple(attention_prompt_data.get(sender_name, []))
+				new_messages.add((sender_type, sender_name, message, targets))
+
+		# ✅ Convert back to lists:
+		senders = list(unique_senders.values())
+		sender_names = list(unique_senders.keys())
+		speakers = list(unique_speakers.values())
+		speaker_names = list(unique_speakers.keys())
+
+		# Player messages must be added to the context here or they are lost forever
+		for stype, sname, msg, _ in new_messages:
+			if stype == "player":
+				debug_print(f"Adding player message \"{msg}\" from <{sname}> to context", color="yellow")
+				self.context_manager.add_message(llm_channel, sname, msg, 0)
+
+		# Cancel batch if only a single speaker self-reply remains
+		if (
+			message_type == "reply"
+			and len(request_speaker_map) == 1
+			and len(senders) == 1
+			and speaker_names[0] == sender_names[0]
+		):
+			request_id = next(iter(request_speaker_map))
+			debug_print(f"Cancelling request {request_id} with same sender/speaker to block self-reply", color="dark_yellow")
+			self.conversation_manager.cancel_request(request_id, speaker_names[0], llm_channel, release=True)
+			request_speaker_map = {}
+
+		if not request_speaker_map:
+			debug_print("Final request speaker map is empty, aborting batch", color="red")
+			return	# Nothing left to send to LLM
+		else:
+			debug_print(f"Final request speaker map for senders {sender_names}:\n{json.dumps(request_speaker_map, indent=4)}", color="dark_cyan")
+
+		# Build the prompt with PromptBuilder
+		prompt = self.prompt_builder.build_prompt(
+			llm_channel=llm_channel,
+			message_type=message_type,
+			senders=senders,
+			speakers=speakers,
+			member_names=member_names,
+			channel_label=channel_label,
+			expansion=expansion,
+			new_messages=new_messages
+		)
+
+		new_messages_text = "\n".join([f"{sender}: {msg}" for _, sender, msg, _ in new_messages])
+
+		# Construct the payload
 		request_payload = {
 			"prompt_data": {
 				"prompt": prompt,
-				"speaker": speaker,
-				"other_names": other_names,
-				"context": context
+				"speaker_names": speaker_names,
+				"member_names": member_names,
+				"llm_channel": llm_channel,
+				"new_messages": new_messages_text
 			},
-			"request_id": request_id,
-			"priority": priority
+			"priority": 1,
+			"request_speaker_map": request_speaker_map
 		}
 		self.llm_manager.queue_request(request_payload)
 
-	def generate(self, data, request_id) -> dict:	# fallback koboldcpp compatible mode
-		debug_print("Kobold-compatible generate called", color="red")
-		prompt = data.get("prompt", "")
-		max_length = data.get("max_length", 100)
-		debug_print(f"koboldcpp mode: prompt received - {prompt}", color="cyan")	
+	def rpg_generate(self, requests_list):
+		"""Generates responses for a batch of bot messages"""
+		debug_print(f"rpg_generate() called with request IDs {[r.get('request_id') for r in requests_list]}", color="magenta")
 
-		# Fix the function name call
-		speaker = self.extract_speaker(prompt)
-		assert speaker is not None, "Speaker is unexpectedly None"
+		if not requests_list:
+			logger.warning("rpg_generate() received an empty request list.")
+			return []
 
-		self.send_to_llm(prompt, speaker, [], "", 4, request_id)
+		if len(requests_list) > 1:
+			logger.warning("rpg_generate() received multiple requests in an RPG batch, rejecting.")
+			return []
 
-	def rpg_generate(self, data, request_id) -> dict:	# bot to NPC interaction
-		debug_print("RPG Generate called", color="red")
-		sender_type		= data.get("sender", {})
-		message_type	= data.get("message_type", {})
-		bot_details		= data.get("bot_details", {})
-		unit_details	= data.get("unit_details", {})
-		expansion		= data.get("expansion", 1)
+		# ✅ Extract first request details (assuming only one)
+		data = requests_list[0]
 
-		message			= data.get("message", "").strip()
-		context			= data.get("context", "").strip()
-		pre_prompt		= data.get("pre_prompt", "").strip()
-		post_prompt		= data.get("post_prompt", "").strip()
+		request_id = data.get("request_id", None)
+		message_type = data.get("message_type", "unknown")
+		speaker_role = data.get("speaker_role", "unknown")
+		bot_details = data.get("bot", {})
+		npc_details = data.get("npc", {})
+		expansion = data.get("expansion", 1)
+		rpg_triggers = data.get("rpg_triggers", {})
+		chat_topic = data.get("chat_topic", "general")
+		llm_channel = data.get("llm_channel", None)
+		message = data.get("message", "")
+		debug_print(f"[rpg_generate] chat_topic = {chat_topic}", color="magenta")
 
-		bot_name		= bot_details.get("name", "unknown")
-		bot_class		= bot_details.get("class", "unknown")
-		bot_guild		= bot_details.get("guild", "unknown")
-		bot_subzone		= bot_details.get("subzone", "unknown")
-		bot_zone		= bot_details.get("zone", "unknown")
-		unit_name		= unit_details.get("name", "unknown")
-		unit_subname	= unit_details.get("subname", "")
-		unit_type		= unit_details.get("type", "unknown")
-		unit_faction	= re.sub(r" generic$", "", unit_details.get("faction", "unknown"))
-		
-		unit_type = "" if unit_type == "unknown" else unit_type
-		unit_faction = "" if re.match(r"^PLAYER, ", unit_faction) else unit_faction
+		bot_data = self.extract_details(bot_details)
+		bot_update = bot_data.copy()
+		bot_name = bot_update.pop("name")
+		self.memory_manager.update_character_info(bot_name, **bot_update)
 
-		# Apply override if bot is in the class overrides dictionary
-		bot_class = self.class_overrides.get(bot_name, bot_class)
+		npc_data = self.extract_details(npc_details, entity_type="npc")
+		npc_name = npc_data["name"]
+		npc_role_info = npc_details.get("npc_options", {})
 
-		speaker, other_names = (
-			(unit_name, [bot_name]) if sender_type == "npc" else (bot_name, [unit_name])
+		sender_name, speaker_name = (npc_name, bot_name) if speaker_role == "bot" else (bot_name, npc_name)
+		# Store request_id -> speaker_name mapping
+		request_speaker_map = {request_id: speaker_name}
+
+		# Build the prompt with PromptBuilder
+		prompt = self.prompt_builder.build_rpg_prompt(
+			llm_channel=llm_channel,
+			speaker_role=speaker_role,
+			bot_data=bot_data,
+			npc_data=npc_data,
+			npc_role_info=npc_role_info,
+			rpg_triggers=rpg_triggers,
+			chat_topic=chat_topic,
+			expansion=expansion
 		)
 
-		# Generate location and guild prompt
-		bot_location = self.get_location(bot_subzone, bot_zone)
-		bot_guild_prompt = f", a member of the guild {bot_guild}" if bot_guild != "No Guild" and bot_guild != "unknown" else ""
-		
-		format_data = {
-			"bot_name": bot_name,
-			"bot_level": bot_details.get("level", "unknown"),
-			"bot_gender": bot_details.get("gender", "unknown"),
-			"bot_race": bot_details.get("race", "unknown"),
-			"bot_class": bot_class,
-			"bot_guild": bot_guild_prompt,
-			"bot_location": bot_location,
-			"unit_name": unit_name,
-			"unit_subname": unit_subname,
-			"unit_type": unit_type,
-			"unit_faction": unit_faction,
-			"unit_level": unit_details.get("level", "unknown"),
-			"unit_gender": unit_details.get("gender", "unknown"),
-			"unit_race": unit_details.get("race", "unknown"),
-			"unit_class": unit_details.get("class", "unknown"),
-			"expansion": generator_expansions[expansion],
-			"max_tokens": generator_max_tokens
+		# Construct the payload
+		request_payload = {
+			"prompt_data": {
+				"prompt": prompt,
+				"speaker_names": [(bot_name if speaker_role == "bot" else npc_name)],
+				"member_names": [bot_name, npc_name],
+				"llm_channel": llm_channel
+			},
+			"priority": 3,
+			"request_speaker_map": request_speaker_map
 		}
-
-		# Get personality if available
-		personality = self.memory_manager.get_personality_formatted(bot_name)
-		personality_section = f"{bot_name}'s Personality:[{personality}] " if speaker == bot_name and personality else ""
-
-		# Conditionally add sections only if they contain data
-		context_section = ""
-		if context:
-			context = self.filter_and_transform(context, speaker, other_names)
-			context = self.remove_duplicate_messages(context)
-			context_section = f"Previous conversation:[{context}] "
-
-		prompt = f"Scene:[{generator_prompt_rpg}] {personality_section}Options:[{pre_prompt}] {context_section}-- {post_prompt} {speaker}:"	  
-		prompt = prompt.format_map(DefaultDict(format_data))
-		prompt = re.sub(r'\s+', ' ', prompt)	# Collapse multiple spaces
-
-		message = self.filter_and_transform(message, speaker, other_names) if message else message
-
-		debug_print(f"generate_rpg sending prompt to LLM - {prompt}", color="cyan")
-		self.send_to_llm(prompt, speaker, other_names, context, 3, request_id)
-
-	def dynamic_generate(self, data, request_id) -> dict:
-		request_time	= data.get("request_time", time.time())
-
-		sender_type		= data.get("sender", {})
-		message_type	= data.get("message_type", {})
-		bot_details		= data.get("bot_details", {})
-		other_details	= data.get("other_details", {})
-		expansion		= data.get("expansion", 1)
-
-		channel_name	= data.get("channel", "")
-		channel_members = data.get("channel_members", {})
-		message			= data.get("message", "").strip()
-		context			= data.get("context", "")
-
-		bot_name		= bot_details.get("name", "unknown")
-		bot_class		= bot_details.get("class", "unknown")
-		bot_guild		= bot_details.get("guild", "unknown")
-		bot_subzone		= bot_details.get("subzone", "unknown")
-		bot_zone		= bot_details.get("zone", "unknown")
-		bot_location	= self.get_location(bot_subzone, bot_zone)
-
-		def get_other_value(key, default="unknown"):
-			return None if message_type == "new" else other_details.get(key, default)
-
-		other_name		= get_other_value('name')
-		other_class		= get_other_value('class')
-		other_guild		= get_other_value('guild')
-		other_subzone	= get_other_value('subzone')
-		other_zone		= get_other_value('zone')
-		other_location	= None if message_type == "new" else self.get_location(other_subzone, other_zone)
-
-		# Apply class overrides from dictionary
-		bot_class = self.class_overrides.get(bot_name, bot_class)
-		if other_name:	# Ensure other_name is not None before lookup
-			other_class = self.class_overrides.get(other_name, other_class)
-
-		in_same_location = bot_location != "unknown" and other_location != "unknown" and bot_location == other_location
-		in_guild_chat	= channel_name == "in guild chat"
-		in_party_chat	= channel_name == "in party chat"
-		debug_print(f"Channel members: {channel_members}", color="yellow")
-		other_names		= list(channel_members.keys()) if channel_members else [other_name]
-		debug_print(f"Extracted names: {other_names}", color="cyan")
-
-		# Process party members & distances
-		is_nearby = False
-		if in_party_chat:
-			debug_print(f"Party Chat Members for {bot_name}:")
-			for member, info in channel_members.items():  # channel_members is always a dict
-				distance = info.get("distance", "unknown")
-				debug_print(f"- {member}: {distance} units away", color="cyan")
-				if member == other_name:
-					other_distance = distance
-					is_nearby = other_distance < 100  # Assume < 100 means "nearby"
-
-		elif in_guild_chat:
-			debug_print(f"Guild Chat Members for {bot_name}:")
-			for member, metadata in channel_members.items():
-				debug_print(f"- {member}", color="green")	 # No need to access metadata for guild chat
-
-		# Generate guild, location, and speaking prompts
-		bot_guild_prompt, other_guild_prompt = self.generate_guild_prompts(bot_guild, other_guild)
-		location_prompt	 = self.generate_location_prompt(bot_name, is_nearby or in_same_location, channel_name, message_type)
-		channel_prompt	 = self.generate_channel_prompt(bot_name, channel_name, channel_members)
-		
-		# 🛠 Ensure speaking_prompt is only calculated when needed
-		directed_names, mentioned_names = [], []
-		speaking_prompt = ""
-
-		scheduling_offset = self.llm_manager.get_scheduling_offset(bot_name)
-		process_timestamp = request_time + scheduling_offset
-		debug_print(f"Message from {other_name} for {bot_name} \"{message}\" has scheduling offset of {scheduling_offset}", color="yellow") 
-
-		command_response = self.process_command(bot_name, message)	# Process commands
-		if not command_response and message_type == "reply":
-			directed_names, mentioned_names = self.is_speaking_to_you(
-				other_name, bot_name, channel_members, message, process_timestamp
-			)
-			speaking_prompt = self.generate_speaking_prompt(bot_name, other_name, directed_names, mentioned_names, message_type)
-
-		debug_print(f"Directed names: {directed_names}", color="yellow")
-		debug_print(f"Mentioned names: {mentioned_names}", color="yellow")
-
-		# Ensure environment doesn't appear when both parts are empty
-		environment = location_prompt + channel_prompt if (location_prompt or channel_prompt) else ""
-
-		# ✅ Build `format_data` BEFORE formatting `environment`
-		format_data = {
-			"bot_name": bot_name,
-			"bot_level": bot_details.get("level", "unknown"),
-			"bot_gender": bot_details.get("gender", "unknown"),
-			"bot_race": bot_details.get("race", "unknown"),
-			"bot_class": bot_class,
-			"bot_guild": bot_guild_prompt,
-			"bot_location": bot_location,
-			"expansion": generator_expansions[expansion],
-			"environment": environment,	 # Temporary placeholder (will be updated below)
-			"channel_name": channel_name,
-			"max_tokens": generator_max_tokens,
-		}
-
-		# ✅ Add "other" details if this is a reply
-		if message_type == "reply":
-			format_data.update({
-				"other_name": other_name,
-				"other_level": other_details.get("level", "unknown"),
-				"other_gender": other_details.get("gender", "unknown"),
-				"other_race": other_details.get("race", "unknown"),
-				"other_class": other_details.get("class", "unknown"),
-				"other_guild": other_guild_prompt,
-				"other_location": other_location,
-			})
-
-		# ✅ Format `environment` only after `format_data` is ready
-		format_data["environment"] = environment.format_map(DefaultDict(format_data))
-
-		# Choose the appropriate base prompt
-		if message_type == "new":
-			prompt = generator_prompt_continue if context else generator_prompt_new
-		else:
-			prompt = generator_prompt_reply
-
-		prompt = prompt.format_map(DefaultDict(format_data))
-
-		# Get personality if available
-		personality = self.memory_manager.get_personality_formatted(bot_name)
-		personality_section = f"{bot_name}'s Personality:[{personality}] " if personality else ""
-
-		# Conditionally add sections only if they contain data
-		context_section = ""
-		if context:
-			context = self.filter_and_transform(context, bot_name, other_names)
-			context = self.remove_duplicate_messages(context)
-			context_section = f"Previous conversation:[{context}] "
-
-		filtered_message = self.filter_and_transform(message, bot_name, other_names) if message else message
-
-		# 🛠 Ensure logging happens BEFORE returning
-		if message_type == "reply" and self.should_ignore_message(filtered_message, bot_name, directed_names, mentioned_names):
-			debug_print(f"Generator: ignored {message_type} message '{message}' from {other_name} to {bot_name}.", color="yellow")
-			ignored_payload = {
-				"prompt_data": {
-					"ignored": True,
-					"speaker": "None"  # ✅ Add a dummy speaker to prevent KeyError
-				},
-				"request_id": request_id,
-				"priority": 0,  # Highest priority (remove from queue ASAP)
-			}
-			self.llm_manager.queue_request(ignored_payload)
-			return	# Exit early
-
-		# Build the final prompt dynamically
-		final_prompt = f"Instructions:[{prompt}]{personality_section}{context_section}"
-		if message_type == "reply":
-			final_prompt += f"{speaking_prompt} {other_name}:{filtered_message}"
-
-		final_prompt += f" {bot_name}:"
-
-		priority = self.get_priority(message_type, sender_type, directed_names, mentioned_names)
-		debug_print(f"Passing other_names: {other_names} to send_to_llm", color="cyan")
-		self.send_to_llm(final_prompt, bot_name, other_names, context, priority, request_id)
-	
-	# sender_name is other_name. new messages should use other_name not bot_name
-	def is_speaking_to_you(self, sender_name, bot_name, channel_members, message, process_timestamp):
-		if not channel_members:	 # Open-world scenario
-			logger.debug(f"No channel members tracked. Assuming open-world context for sender: {sender_name}")
-			return [], []  # Return empty list for assumptive response
-
-		# Convert channel_members keys to a simple lower-cased list
-		sender_name_lower = sender_name.lower()	 # Precompute lowercased sender_name
-		directed_names = []
-		mentioned_names = []
-
-		# Reset attention state and exit if a generic greeting is detected
-		if re.search(r"\b(hey|hello|hi|yo)\s+(guys|everyone|all|people|guildies)\b", message, re.IGNORECASE):
-			debug_print(f"Generic greeting detected: '{message}'. Clearing attention state and resetting lists.", color="green")
-
-			# Safely clear the attention state for the bot and sender
-			if bot_name in self.attention_state:
-				if sender_name in self.attention_state[bot_name]:
-					# Clear the entire nested attention state for this sender
-					self.attention_state[bot_name][sender_name].clear()
-					debug_print(f"Cleared attention state for bot: {bot_name}, sender: {sender_name}", color="yellow")
-
-			# Return empty lists for directed and mentioned names
-			return [], []
-
-		# Match potential names in the message for direct addressing
-		for regex_pattern in [
-			(
-				r"\b(\w+)(,|\s(what|why|how|where|when|you|you'?re|you'?ll|"
-				r"are|do|don'?t|have|haven'?t|go|come|see|run|want|need|think)\b)"
-			),
-			r"\b(\w+)\b(?:\?|[.?!,]+$)",
-			r"\b(hi|hello|hey)\s+(\w+)",  # Match greetings followed by a name
-		]:
-			match = re.search(regex_pattern, message, re.IGNORECASE)
-			if match:
-				# Extract the name depending on the regex pattern
-				if regex_pattern == r"\b(hi|hello|hey|yo)\s+(\w+)":
-					possible_name = match.group(2)	# Name is in the second group for greetings
-				else:
-					possible_name = match.group(1)	# Name is in the first group for other patterns
-
-				# Resolve the name and add to directed_names
-				name = self.full_name(possible_name, channel_members)
-				if name and name not in directed_names:
-					directed_names.append(name)
-					
-		# Match names for passive mentions
-		for regex_pattern in [
-			r"\b(\w+)\b",  # Match any word
-		]:
-			matches = re.findall(regex_pattern, message, re.IGNORECASE)
-			for possible_name in matches:
-				name = self.full_name(possible_name, channel_members)
-				if name and name not in directed_names and name not in mentioned_names:
-					mentioned_names.append(name)
-
-		# Load existing attention state
-		old_directed_names = []
-		old_mentioned_names = []
-		attention_state = self.check_attention(sender_name, bot_name, process_timestamp)
-		logger.debug(f"Existing attention for {bot_name}: {attention_state}")
-
-		# Categorize old attention states
-		for name, data in attention_state.items():
-			attention = data.get("attention")
-			logger.debug(f"Name: {name}, Attention Type: {attention}")
-			if attention == "directed":
-				old_directed_names.append(name)
-			elif attention == "mentioned":
-				old_mentioned_names.append(name)
-
-		# Update attention states and timestamps
-		updated_directed_names = set(directed_names)
-		updated_mentioned_names = set(mentioned_names)
-
-		# Refresh timestamps for current attention
-		with self.attention_lock:
-			for name in updated_mentioned_names:
-				self.attention_state[bot_name][sender_name][name] = {
-					"attention": "mentioned",
-					"timestamp": process_timestamp,
-				}
-			for name in updated_directed_names:
-				logger.debug(f"Updated directed name for {bot_name}: Sender: {sender_name}, Name: {name}, Attention: directed")
-				self.attention_state[bot_name][sender_name][name] = {
-					"attention": "directed",
-					"timestamp": process_timestamp,
-				}
-
-		# Merge with old states, avoiding duplicates
-		directed_names = list(updated_directed_names | set(old_directed_names))	 # Union of current and old directed
-		mentioned_names = list(updated_mentioned_names | set(old_mentioned_names))	# Union of current and old mentioned
-
-		# Remove bot_name from mentioned_names if it exists in both lists
-		if bot_name in directed_names and bot_name in mentioned_names:
-			debug_print(f"Duplicate name found in both directed and mentioned name lists. Removing from mentioned_names.", color="red")
-			mentioned_names.remove(bot_name)
-
-		return directed_names, mentioned_names
-
-	def should_ignore_message(self, message, bot_name, directed_names, mentioned_names):
-		debug_print(f"should_ignore_message called", color="white")
-		if message.strip() == "":
-			debug_print(f"Ignore message: empty string", color="yellow")
-			return True
-
-		# Case 1: Directed names exist, bot is not addressed, and mentioned names are empty
-		if directed_names and bot_name not in directed_names and not mentioned_names:
-			debug_print(f"Ignore message: {bot_name} not addressed ({directed_names}), no mentioned names", color="yellow")
-			return True
-
-		# Case 2: Directed names exist, bot is not addressed, and bot is not mentioned	e.g. Bunking hears "Hi Zyria"
-		if directed_names and bot_name not in directed_names and mentioned_names and bot_name not in mentioned_names:
-			debug_print(f"ignore message: {bot_name} not addressed ({directed_names}) or mentioned ({mentioned_names})", color="yellow")
-			return True
-
-		# Case 3: No directed names, but bot is mentioned	e.g. Yvelza hears "Flowerbasket is crazy"
-		if not directed_names and mentioned_names and bot_name in mentioned_names:
-			debug_print(f"Allow message: no directe names but {bot_name} is mentioned ({mentioned_names})", color="yellow")
-			return False
-
-		# Default: Allow the bot to process the message based on reply chance
-		chance = random.randint(1, 100) > generator_bot_reply_chance
-		if chance:
-			debug_print(f"Ignore message: {bot_name} passes check, but fails bot reply chance", color="yellow")
-		else:
-			debug_print(f"Allow message: directed names = {directed_names} - mentioned names = {mentioned_names}", color="yellow")
-
-		return chance
-
-	def check_attention(self, sender_name, bot_name, process_timestamp):
-		with self.attention_lock:
-			# Ensure the top-level structure for bot_name exists
-			if bot_name not in self.attention_state:
-				self.attention_state[bot_name] = {}
-
-			# Ensure the sender_name structure exists under bot_name
-			if sender_name not in self.attention_state[bot_name]:
-				self.attention_state[bot_name][sender_name] = {}
-
-			# Iterate over the names tracked for this bot and sender
-			to_remove = []	# Collect keys to remove if attention is outdated
-			for name, attention_data in self.attention_state[bot_name][sender_name].items():
-				attention_timestamp = attention_data.get("timestamp", 0)
-
-				debug_print(f"Processing timestamp: {process_timestamp}")
-				debug_print(f"Attention timestamp for {name}: {attention_timestamp}")
-				debug_print(f"Elapsed time: {process_timestamp - attention_timestamp}")
-				debug_print(f"Attention timeout: {generator_attention_timeout}")
-
-				# Clear outdated attention state
-				if process_timestamp - attention_timestamp > generator_attention_timeout:
-					debug_print(f"Clearing outdated attention state for {name} from {sender_name} to {bot_name}.", color="yellow")
-					to_remove.append(name)
-
-			# Remove outdated attention entries
-			for name in to_remove:
-				del self.attention_state[bot_name][sender_name][name]
-
-			# Return the remaining valid attention state for this bot and sender
-			return self.attention_state[bot_name][sender_name]
-
-	def remove_duplicate_messages(self, context):
-		"""
-		Removes duplicate messages from a long single-line chat log,
-		keeping only the last occurrence of each identical message.
-		"""
-		lines = context.split()	 # Split by whitespace (since there's no newlines)
-		seen = set()
-		filtered_lines = []
-
-		# Process in reverse to keep only the last occurrence
-		for line in reversed(lines):
-			if line not in seen:
-				seen.add(line)
-				filtered_lines.append(line)
-
-		# Reverse back to original order
-		return " ".join(reversed(filtered_lines))
+		self.llm_manager.queue_request(request_payload)
 
 	def filter_and_transform(self, text, speaker, other_names):
 		# helper functions
@@ -560,15 +451,6 @@ class Generator:
 		debug_print(f"filter_and_transform OUTPUT: {text}", color="green")
 		return text
 
-	def process_context(self, context, speaker, other_names):
-		# Abort if context is empty
-		if not context or not context.strip():
-			debug_print("process_context: context is empty. Skipping.")
-			return ""
-
-		context = self.filter_and_transform(context, speaker, other_names)
-		return context
-	
 	def process_command(self, bot_name, message):
 		"""
 		Detects memory commands (remember, forget, list) and delegates processing.
@@ -592,121 +474,6 @@ class Generator:
 		# Delegate command processing to memory_manager
 		return self.memory_manager.handle_memory_command(bot_name, command_type, command_body)
 
-	def split_dialog(self, text):
-		pattern = r"(\b[^\s:]+:[^\s:].*?)(?=\s[^\s:]+:|$)"
-		return [match.strip() for match in re.findall(pattern, text)]
-
-	def extract_speaker(self, prompt):
-		# or rename to extract_speaker_name in your generate() if you prefer
-		match = regex.search(r"\s(\w+):$", prompt)
-		if match:
-			return match.group(1)
-		return None
-
-	def full_name(self, shortened, members):
-		shortened_lower = shortened.lower()
-
-		# Exclude if the shortened name is less than 2 characters
-		if len(shortened_lower) < 2:
-			return None
-
-		# Define a set of excluded common words
-		excluded_words = {"on", "of", "and", "the", "in", "at", "to", "for", "by", "with"}
-		if shortened_lower in excluded_words:
-			return None
-
-		# Check if shortened matches the start of any full name
-		for full_name in members:
-			if full_name.lower().startswith(shortened_lower):
-				logger.debug(f"Likely name reference '{shortened_lower}' expanded to '{full_name}'")
-				return full_name	# Return the full name if a match is found
-
-		return None
-
-	def get_location(self, subzone, zone):
-		if subzone and zone:
-			location = f"{subzone}, {zone}"
-		elif subzone:
-			location = subzone
-		elif zone:
-			location = zone
-		else:
-			location = "unknown"
-
-		return location
-
-	def generate_guild_prompts(self, bot_guild, other_guild):
-		guild_prompts = {
-			"unknown": "",
-			"No Guild": " and are not in a guild"
-		}
-
-		bot_guild_prompt = guild_prompts.get(bot_guild, f" and are a member of the guild {bot_guild}")
-
-		if other_guild == bot_guild and bot_guild not in {"unknown", "No Guild"}:
-			other_guild_prompt = f" and is also a member of {bot_guild}"
-		else:
-			other_guild_prompt = guild_prompts.get(other_guild, f" and is a member of the guild {other_guild}")
-
-		return bot_guild_prompt, other_guild_prompt
-
-	def generate_location_prompt(self, bot_name, in_same_location, channel_name, message_type):
-		if message_type == "new":
-			return generator_prompt_location
-
-		location_prompts = {
-			(True, "in party chat"): generator_prompt_location_party,
-			(True, None): generator_prompt_location_nearby,	 # Any other channel when `in_same_location` is True
-			(False, None): generator_prompt_location_apart	# Always used when `in_same_location` is False
-		}
-
-		return location_prompts.get((in_same_location, channel_name), generator_prompt_location_apart)
-
-	def generate_channel_prompt(self, bot_name, channel_name, channel_members):
-		prompt = ""
-		if len(channel_members) > 1:
-			channel_members.pop(bot_name, None)	 # Safely remove the bot's name if it exists
-
-			# Insert channel members as english readable list into prompt
-			prompt = " " + generator_prompt_channel.format(
-				channel_name = channel_name,
-				channel_members = self.format_list_to_english(list(channel_members.keys())),
-			)
-
-		return prompt
-
-	def generate_speaking_prompt(self, bot_name, other_name, directed_names, mentioned_names, message_type):
-		prompt = ""
-		if message_type == "new":
-			return prompt
-
-		if bot_name in directed_names:
-			if len(directed_names) > 1:
-				directed_names.remove(bot_name)
-				directed_names.append("yourself")
-			else:
-				directed_names = ["you"]
-
-			# Add speaking-to prompt
-			prompt += generator_prompt_speaking_to.format(
-				other_name = other_name,
-				directed_names = self.format_list_to_english(directed_names),
-			)
-		elif bot_name in mentioned_names:
-			# Add mentioned prompt
-			prompt += generator_prompt_mentioned.format(
-				other_name = other_name,
-				directed_names = self.format_list_to_english(directed_names),
-			)
-		else:
-			# Default to assuming 'you' as the addressed name
-			prompt += generator_prompt_speaking_to.format(
-				other_name = other_name,
-				directed_names = "you",
-			)
-
-		return prompt
-
 	def get_priority(self, message_type, sender, directed_names, mentioned_names):
 		# Define base priorities
 		base_priority = {
@@ -723,38 +490,3 @@ class Generator:
 		priority += 1 if not mentioned_names else 0	 # If no mention, lower priority
 
 		return priority
-
-	def convert_placeholders(self, text):
-		"""Convert C++ <placeholders> to Python {placeholders}."""
-		return re.sub(r"<(.*?)>", lambda m: f"{{{m.group(1).strip().replace(' ', '_')}}}", text)
-
-	def format_list_to_english(self, items):
-		"""
-		Formats a list of items into a grammatically correct English string.
-		
-		Args:
-			items (list): The list of items to format.
-
-		Returns:
-			str: A string with the items in proper English format.
-		"""
-		if not items:
-			return ""  # Return empty string for empty lists
-		if len(items) == 1:
-			return items[0]	 # Return the only item
-		elif len(items) == 2:
-			return f"{items[0]} and {items[1]}"	 # Return two items joined with 'and'
-		else:
-			return f"{', '.join(items[:-1])}, and {items[-1]}"	# Properly join for 3+ items
-
-	def dump_attention_state(self, filepath="attention_state.json"):
-		"""
-		Saves the current attention state to a JSON file.
-		"""
-		try:
-			with open(filepath, "w") as f:
-				json.dump(self.attention_state, f, indent=4)
-			logger.debug(f"Attention state saved to {filepath}.")
-		except Exception as e:
-			logger.error(f"Failed to save attention state: {e}")
-

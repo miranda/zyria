@@ -1,0 +1,51 @@
+{
+    "personality": {
+        "backstory": [
+            "A short description of the bot or player's personality and history",
+            "Include quirks, special traits, or personal story hooks",
+            "Can mention other bots or players and include info i.e. Botname {player_info}",
+            "Do not terminate entries with periods, they are added automatically"
+        ],
+        "pets": [
+            "A pet name/type here"
+        ],
+        "likes": [
+            "Things the player/bot likes"
+        ],
+        "dislikes": [
+            "Things the player/bot dislikes"
+        ]
+    },
+    "events": [],
+    "relationships": {
+        "girlfriend": [
+			"Botname {player_status}"
+		],
+        "boyfriend": [
+			"Botname {player_status}"
+		],
+        "husband": [
+			"Botname {player_status}"
+		],
+        "friends": [
+			"BotName {player_status}",
+			"BotName {player_status}"
+		],
+        "rivals": [
+			"Botname {player_status}"
+		]
+    },
+    "character": {
+		"type": "(populated by server)",
+		"gender": "(populated by server)",
+		"level": "(populated by server)",
+		"class": "(populated by server)",
+		"race": "(populated by server)",
+		"spec": "(populated by server)",
+		"guild": "(populated by server)",
+		"zone": "(populated by server)",
+		"subzone": "(populated by server)",
+		"continent": "(populated by server)"
+	}
+}
+

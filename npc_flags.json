@@ -1,0 +1,74 @@
+{
+    "0x00000001": {
+        "role": "gossip",
+        "prompt": "{name} can chat some."
+    },
+    "0x00000002": {
+        "role": "questgiver",
+        "prompt": "{name} can offer quests."
+    },
+    "0x00000010": {
+        "role": "trainer",
+        "prompt": "{name} can train certain skills."
+    },
+    "0x00000020": {
+        "role": "trainer_class",
+        "prompt": "{name} can train in class-specific skills."
+    },
+    "0x00000040": {
+        "role": "trainer_profession",
+        "prompt": "{name} can train professions."
+    },
+    "0x00000080": {
+        "role": "vendor",
+        "prompt": "{name} can sell and buy items."
+    },
+    "0x00002000": {
+        "role": "flight master",
+        "prompt": "{name} is a flight master."
+    },
+    "0x00004000": {
+        "role": "spirit healer",
+        "prompt": "{name} can revive the dead."
+    },
+    "0x00010000": {
+        "role": "innkeeper",
+        "prompt": "{name} runs an inn."
+    },
+    "0x00020000": {
+        "role": "banker",
+        "prompt": "{name} can store items in the bank."
+    },
+    "0x00040000": {
+        "role": "petitioner",
+        "prompt": "{name} can create new guilds."
+    },
+    "0x00080000": {
+        "role": "tabard designer",
+        "prompt": "{name} can redesign the guild tabard."
+    },
+    "0x00100000": {
+        "role": "battlemaster",
+        "prompt": "{name} recruits players for battlegrounds."
+    },
+    "0x00200000": {
+        "role": "auctioneer",
+        "prompt": "{name} is an auctioneer."
+    },
+    "0x00400000": {
+        "role": "stablemaster",
+        "prompt": "{name} can store pets."
+    },
+    "0x00800000": {
+        "role": "guild banker",
+        "prompt": "{name} manages the guild bank."
+    },
+    "0x01000000": {
+        "role": "spellclick",
+        "prompt": "{name} can be activated using magic."
+    },
+    "bonus_options": {
+        "talents": "{name} can help you unlearn your talents.",
+        "pet_skills": "{name} can help pets unlearn their skills."
+    }
+}

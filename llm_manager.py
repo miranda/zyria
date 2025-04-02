@@ -1,296 +1,550 @@
 from llama_cpp import Llama
-import configparser, re, regex
-from collections import defaultdict
-import json, time, random
+import re
+from collections import OrderedDict
+import random
 import threading
-import queue, heapq
+import queue
+import heapq
 import traceback
-import logging
 from log_utils import debug_print, logger
 from rapidfuzz import process, fuzz
+import nltk
 from nltk.corpus import words
-
-# Load English words for dictionary check
-english_words = set(words.words())
-
-config = configparser.ConfigParser()
-config.read('zyria.conf')
-
-llm_model_path		= config.get('LLM Manager', 'ModelPath')
-llm_gpu_layers		= int(config.get('LLM Manager', 'GPULayers', fallback='0'))
-llm_threads			= int(config.get('LLM Manager', 'Threads', fallback='1'))
-llm_max_tokens		= int(config.get('LLM Manager', 'MaxTokens', fallback='60'))
-llm_context_tokens	= int(config.get('LLM Manager', 'ContextTokens', fallback='2048'))
+import unicodedata
+import itertools
 
 class LLMManager:
-	def __init__(self, response_callback):
+	def __init__(self, config, *, context_manager, response_callback):
+		self.config = config
+		self.context_manager = context_manager
+		self.response_callback = response_callback	# Store callback function
+
+		self.blocked_tokens			 = config.get('LLM Manager', 'BlockedTokens', fallback='')
+		self.base_tokens_per_speaker = int(config.get('LLM Manager', 'BaseTokensPerSpeaker', fallback='30'))
+		self.tokens_dialog_factor	 = float(config.get('LLM Manager', 'TokensDialogFactor', fallback='1.5'))
+		self.min_tokens				 = int(config.get('LLM Manager', 'MinTokens', fallback='50'))
+		self.max_tokens				 = int(config.get('LLM Manager', 'MaxTokens', fallback='150'))
+
 		self.model = Llama(
-			model_path=llm_model_path,
-			n_gpu_layers=llm_gpu_layers,
-			n_threads=llm_threads,
-			n_ctx=llm_context_tokens
+			model_path=config.get('LLM Manager', 'ModelPath'),
+			n_gpu_layers=int(config.get('LLM Manager', 'GPULayers', fallback='0')),
+			n_threads=int(config.get('LLM Manager', 'Threads', fallback='1')),
+			n_ctx=int(config.get('LLM Manager', 'ContextTokens', fallback='4096'))
 		)
-		self.response_callback = response_callback
+
+		# Predefined blocked words (these never change)
+		self.logit_bias = self.tokenize_blocked_chars(self.blocked_tokens)
+			
+		# Load English words for dictionary check
+		self.english_words = set(words.words())
+
+		# Set a maxsize of 100 for our priority queue.
 		self.queue = queue.PriorityQueue(maxsize=100)
 		self.lock = threading.Lock()
-		self.bot_last_speak_time = {}  # Tracks last message time for each bot
 		self.worker_thread = threading.Thread(target=self.process_queue, daemon=True)
 		self.worker_thread.start()
+		self.request_counter = itertools.count()
+		
+		self.queued_bot_dialog = {}	 # Maps (llm_channel, marker_name) -> {"text": ..., "timestamp": ...}
+
+	def update_words(self):
+		try:
+			nltk.data.find('corpora/words')
+		except LookupError:
+			nltk.download('words')
+
+	def tokenize(self, word):
+		if not isinstance(word, bytes):	 # Ensure conversion only if necessary
+			word = word.encode("utf-8")
+		
+		result = self.model.tokenize(word, add_bos=False)
+		return result
 
 	def queue_request(self, request_payload):
-		"""Queues a request and schedules its processing to prevent bots from speaking at the same time."""
+		"""
+		Queues a request for the LLM.
+		
+		If the queue is full (100 items), it removes all requests with the worst (i.e. highest
+		numerical) priority from the queue (calling the callback for each with a 'purged' result).
+		If the new request itself is not better than what is already in the queue, it is dropped.
+		"""
+
 		priority = request_payload["priority"]
-		request_id = request_payload["request_id"]
 		prompt_data = request_payload["prompt_data"]
+		request_speaker_map = request_payload["request_speaker_map"]
 
-		# ✅ Handle ignored requests immediately and return
-		if prompt_data.get("ignored", False):
-			logger.debug(f"LLMManager: Request {request_id} ignored. Returning empty response immediately.")
-			ignored_response = {
-				"text": "",
-				"finish_reason": "stop",
-				"prompt_tokens": 0,
-				"completion_tokens": 0,
-			}
-			self.response_callback(request_id, ignored_response)
-			return	# ✅ Do not add ignored requests to the queue
-
-		bot_name = prompt_data["speaker"]  # Get the bot name
+		logger.info(f"Queueing request batch {request_speaker_map} - Priority {priority}")
 
 		with self.lock:
-			now = time.time()
-			last_speak_time = self.bot_last_speak_time.get(bot_name, now)
+			# If the queue is full, purge lowest priority requests.
+			if self.queue.qsize() >= self.queue.maxsize:
+				# Get current items (thread-safe under lock)
+				current_items = list(self.queue.queue)
 
-			# Calculate delay (minimum of 3 sec, +2 sec for each stacked request)
-			base_delay = 3
-			additional_delay = 2 * sum(1 for _, _, _, p in self.queue.queue if p["speaker"] == bot_name)
-			next_speak_time = max(now, last_speak_time) + base_delay + additional_delay
+				# Determine the worst priority in the queue
+				worst_priority = max(item[0] for item in current_items)
 
-			self.bot_last_speak_time[bot_name] = next_speak_time  # Update last speak time
+				if priority < worst_priority:
+					# New request is of higher importance → Purge lowest-priority items
+					purge_candidates = [item for item in current_items if item[0] == worst_priority]
 
-			debug_print(f"Scheduling {bot_name} to speak in {next_speak_time - now:.2f}s", color="cyan")
+					for item in purge_candidates:
+						try:
+							self.queue.queue.remove(item)
+							self.queue.task_done()	# ✅ Mark as processed
 
-			# Schedule the message at the correct time
-			heapq.heappush(self.queue.queue, (next_speak_time, priority, request_id, prompt_data))
+							_, purged_prompt_data, purged_request_map = item  # ✅ Extract purged data
+							logger.debug(f"Purging request (priority {item[0]})")
+
+							# ✅ Call callback with 'purged' result
+							self.cancel_response(purged_request_map, finish_reason="purged")
+
+						except ValueError:
+							pass  # Item was already removed
+
+					# Re-heapify after manual removals
+					heapq.heapify(self.queue.queue)
+
+				else:
+					# New request is lower priority → Drop it
+					logger.debug(f"Dropping request (priority {priority}) because queue is full")
+					self.cancel_response(request_speaker_map, finish_reason="dropped")
+					return	# ✅ Do not add this request
+
+			# ✅ Add new request to queue
+			self.queue.put((priority, next(self.request_counter), prompt_data, request_speaker_map))
+
+	def cancel_response(self, request_speaker_map, finish_reason="stop"):
+		"""
+		Cancels a response and returns an empty response dictionary.
+		This is used when a request is dropped or purged.
+		"""
+
+		response_dict = {}
+
+		for request_id in request_speaker_map:
+			response_dict[request_id] = {
+				"text": "",
+				"finish_reason": finish_reason,
+				"prompt_tokens": 0,
+				"completion_tokens": 0,
+			}
+
+		return response_dict  # Return correctly structured response dictionary
 
 	def process_queue(self):
-		"""Processes the queue, sending requests to the LLM when their scheduled time arrives."""
+		"""Processes the queue, sending requests to the LLM"""
 		while True:
-			with self.lock:
-				if not self.queue.queue:
-					time.sleep(0.1)
-					continue
+			try:
+				# Get next request from queue
+				priority, batch_id, prompt_data, request_speaker_map = self.queue.get()
+				debug_print(f"Processing request batch {request_speaker_map} - Priority {priority}")
 
-				now = time.time()
-				next_speak_time, priority, request_id, prompt_data = self.queue.queue[0]
+				# Send prompt data to LLM
+				response_dict = self.call_llm(prompt_data, request_speaker_map)
 
-				if now >= next_speak_time:
-					heapq.heappop(self.queue.queue)	 # Remove from queue
-					
-					debug_print(f"{prompt_data['speaker']} speaking now: {prompt_data['prompt']}", color="green")
+				# Send back responses to server via callback
+				self.response_callback(response_dict)
 
-					# Call the LLM and return the result
-					result = self.call_llm(prompt_data)
-					self.response_callback(request_id, result)
+				# Mark task as completed
+				self.queue.task_done()
 
-			time.sleep(0.1)	 # Prevent CPU overload
+			except Exception as e:
+				logger.error(f"Error processing queue - {e}")
+				logger.error(traceback.format_exc())  # ✅ Print full stack trace
 
-	def call_llm(self, prompt_data):
-		"""Generates a response from the LLM"""
-		try:
-			result = self.model(prompt=prompt_data["prompt"], max_tokens=llm_max_tokens)
+	def estimate_tokens(self, num_speakers): 
+		"""
+		Estimate token budget based on number of speakers and expected dialog complexity.
+		- base_per_speaker = base tokens assuming each speaker says something.
+		- dialog_factor = average number of utterances per speaker (1.0 = 1 line each, 1.5 = about half speak twice).
+		"""
+		estimate = int(num_speakers * self.base_tokens_per_speaker * self.tokens_dialog_factor)
+		return max(self.min_tokens, min(estimate, self.max_tokens))
 
-			# Extract response text
-			result_text = result['choices'][0]['text'] if 'choices' in result and len(result['choices']) > 0 else ""
-			debug_print(f"LLMManager: Generated text - {result_text}", color="none")
+	def call_llm(self, prompt_data, request_speaker_map):
+		"""Generates responses from the LLM for multiple speakers in a batch."""
 
-			return {
-				"text": result_text,
-				"finish_reason": result["choices"][0].get("finish_reason", "unknown"),
-				"prompt_tokens": result.get("usage", {}).get("prompt_tokens", 0),
-				"completion_tokens": result.get("usage", {}).get("completion_tokens", 0),
-			}
-
-		except Exception as e:
-			logger.error(f"LLMManager: Error calling LLM - {e}")
-			return {
-				"text": "",
-				"finish_reason": "error",
-				"prompt_tokens": 0,
-				"completion_tokens": 0,
-			}
-
-	def get_scheduling_offset(self, bot_name):
-		"""Returns the total scheduling delay for a bot."""
-		return sum(2 for item in self.queue.queue if isinstance(item, tuple) and len(item) == 3 and isinstance(item[2], dict) and item[2].get("speaker") == bot_name)
-
-	def call_llm(self, prompt_data):
-		"""Generates a response from the LLM"""
 		prompt = prompt_data["prompt"]
-		speaker = prompt_data["speaker"]
-		other_names = prompt_data.get("other_names", [])
-		context = prompt_data.get("context", "")
-		debug_print(f"call_llm received other_names: {prompt_data.get('other_names', [])}", color="green")
-
-		# ✅ Dynamically format the context section
-		context_section = f"Previous conversation:[{context}] " if context else ""
-		formatted_prompt = prompt.format(context_section=context_section)
-
-		debug_print(f"LLMManager: Sending prompt to LLM - {formatted_prompt}", color="blue")
-
-		# Debugging: Check if anything is None
-		if prompt is None:
-			logger.error("LLMManager: ERROR - prompt is None!")
-		if speaker is None:
-			logger.error("LLMManager: ERROR - speaker is None!")
-		if other_names is None:
-			logger.error("LLMManager: ERROR - other_names is None!")
-		if context is None:
-			logger.error("LLMManager: ERROR - context is None!")
+		llm_channel = prompt_data["llm_channel"]
+		member_names = prompt_data["member_names"]
+		num_speakers = len(request_speaker_map)
+		max_tokens = self.estimate_tokens(num_speakers)
 
 		try:
-			result = self.model(prompt=formatted_prompt, max_tokens=llm_max_tokens)
 
-			# Extract response text
-			result_text = result['choices'][0]['text'] if 'choices' in result and len(result['choices']) > 0 else ""
-			debug_print(f"LLMManager: generated text - {result_text}", color="none")
+			# 🚀 Call LLM with the formatted prompt
+			result = self.model(
+				prompt=prompt,
+				max_tokens=max_tokens,
+				logit_bias=self.logit_bias,
+#				temperature=0.6,		 # Lower randomness
+#				top_k=40,				 # Limits word choices
+#				top_p=0.8,				 # Probability mass filtering
+#				repeat_penalty=1.2,
+			)
 
-			# Filter names and dialog 
-			result_text = self.filter_text(result_text, speaker, other_names, context)
-			result_text = self.trim_to_last_punctuation(result_text)	# Drop incomplete sentences
+			choice = result['choices'][0] if 'choices' in result and result['choices'] else {}
+			finish_reason = choice.get('finish_reason', '')
+			completion_tokens = result.get('usage', {}).get('completion_tokens', 0)
 
-			if result_text:
-				result_text = self.correct_misspelled_names(result_text, other_names)
-				result_text = self.insert_split_markers(result_text, random.uniform(25, 50))
+			# ✅ Extract response text
+			raw_output = choice.get('text', "")
+			logger.info(f"Generated response for {num_speakers} speakers, Max tokens {max_tokens}")
+			debug_print(f"Raw LLM generated output:\n{raw_output}", color="blue")
 
-			debug_print(f"LLMManager: Final response from {speaker}: '{result_text}'")
+			# Process batch response for multiple speakers
+			dialogues, speaker_order = self.parse_batch_text(raw_output, prompt_data, request_speaker_map)
+			final_responses = self.apply_delays_to_dialogues(dialogues, speaker_order, request_speaker_map)
+			
+			response_dict = {}
 
-			return {
-				"text": result_text,
-				"finish_reason": result["choices"][0].get("finish_reason", "unknown"),
-				"prompt_tokens": result.get("usage", {}).get("prompt_tokens", 0),
-				"completion_tokens": result.get("usage", {}).get("completion_tokens", 0),
-			}
+			for request_id, response_data in final_responses.items():  # Unpack request_id and data
+				response_text = response_data.get("speaker_response", "")
+				response_delay = response_data.get("response_delay", 0)
+				speaker_name = response_data.get("speaker_name", "Unknown")	 # Now correctly extracted
+				if response_text:
+					debug_print(f"Parsed valid response for <{speaker_name}>: ", end="")
+				else:
+					debug_print(f"Returned empty response for <{speaker_name}>: ", end="")
+				debug_print(f"\"{response_text}\"", color="cyan", quiet=True)
+
+				response_dict[request_id] = {
+					"mangos_response": {
+						"text": response_text,
+						"finish_reason": result["choices"][0].get("finish_reason", "unknown"),
+						"prompt_tokens": result.get("usage", {}).get("prompt_tokens", 0),
+						"completion_tokens": result.get("usage", {}).get("completion_tokens", 0),
+					},
+					"speaker_name": speaker_name,
+					"llm_channel": llm_channel,
+					"response_delay": response_delay,
+					"conversation_members": list(request_speaker_map.values())	# all speakers involved in the LLM response
+				}
+
+			return response_dict  # Now returns {request_id: {mangos_response + delay}}
 
 		except Exception as e:
-			logger.error(f"LLMManager: Error calling LLM - {e}")
+			logger.error(f"Error calling LLM - {e}")
 			return {
-				"text": "",
-				"finish_reason": "error",
-				"prompt_tokens": 0,
-				"completion_tokens": 0,
-			}
+				request_id: {
+					"mangos_response": {
+						"text": "",
+						"finish_reason": "error",
+						"prompt_tokens": 0,
+						"completion_tokens": 0,
+					},
+					"speaker_name": request_speaker_map.get(request_id, "Unknown"),
+					"llm_channel": llm_channel,
+					"response_delay": 0	# Default delays to 0 in case of an error
+				} for request_id in request_speaker_map.keys()
+			}  # ✅ Return structured empty responses for all
 
-	def filter_text(self, text, speaker, other_names, context=""):
-		"""
-		Filters out improperly formatted name markers while keeping the intended dialogue.
-		Removes repeated name markers and stops processing when an unrelated name appears.
-		"""
-		if not text or re.fullmatch(r"[^a-zA-Z]+", text):
-			return ""
+	def clean_raw_output(self, raw_output):
+		# Remove any hidden characters
+		cleaned_output = re.sub(r'[^\x20-\x7E\n]+', '', raw_output)
 
-		# === Step 1: Initial Cleanup ===
-		text = text.strip()
-		text = re.sub(r"</?[^>]+>", "", text)	# Delete hallucination HTML tags
-		text = re.sub(r"^[^\w\*]+", "", text)	# Delete leading non-alphanumerics
-		text = re.sub(r'\s+', ' ', text)		# Collapse multiple spaces
-		text = re.sub(r'\[|\]', "", text)		# Strip goofy brackets
-		text = re.sub(r"\*\*", "", text)		# Strip goofy double asterisks
-		text = self.clean_single_quotes(text)	# Strip stupid single quotes
+		# Remove LLM formatting lines starting with ### or ##
+		cleaned_output = re.sub(r'^\s*#+\s*\w.*$', '', cleaned_output, flags=re.MULTILINE)
 
+		# Remove lines like "Reply 1:" or "Bradpittlord:" with no content
+		cleaned_output = re.sub(r'^\s*[\w ]+:\s*$', '', cleaned_output, flags=re.MULTILINE)
+
+		# Remove extra blank lines (e.g., from stripped speaker-only lines)
+		cleaned_output = re.sub(r'\n{2,}', '\n', cleaned_output)
+
+		# Remove lines with only non-alphanumeric characters
+		cleaned_output = re.sub(r'^\s*[^\w\n]+\s*$\n?', '', cleaned_output, flags=re.MULTILINE)
+
+		# Normalize unicode (like smart quotes, em dashes, etc.)
+		cleaned_output = unicodedata.normalize("NFKC", cleaned_output).strip()
+
+		# Collapse multiple newlines into one
+		cleaned_output = re.sub(r'\n+', '\n', cleaned_output).strip()
+
+		return cleaned_output
+
+	def strip_outer_quotes(self, text):
 		if not text:
-			return ""
+			return text
 
-		# === Step 2: Create regex for name markers ===
-		valid_names = [speaker] + other_names
-		valid_names_sorted = sorted(valid_names, key=len, reverse=True)
-		valid_pattern = r"(?:{})".format("|".join(map(re.escape, valid_names_sorted)))
+		# Remove exactly one leading quote if present
+		if text.startswith('"'):
+			text = text[1:]
 
-		# Match valid name markers and guessed names (single words before `:`)
+		# Remove exactly one trailing quote if present
+		if text.endswith('"'):
+			text = text[:-1]
+
+		return text
+
+	def remove_echoes(self, raw_output, context_lines):
+		"""
+		Removes echoed prefixes from raw_output lines if they start with a dialog from context.
+		"""
+		def extract_dialog(line):
+			parts = line.split(":", 1)
+			return parts[1].strip() if len(parts) == 2 else ""
+
+		context_dialogs = set(extract_dialog(line) for line in context_lines if ":" in line)
+
+		output_lines = raw_output.strip().split('\n')
+		filtered_output = []
+
+		for line in output_lines:
+			if ":" not in line:
+				filtered_output.append(line)
+				continue
+
+			speaker, dialog = line.split(":", 1)
+			dialog = dialog.strip()
+
+			# Remove prefix if matching any context line
+			for ctx_dialog in context_dialogs:
+				if dialog.startswith(ctx_dialog):
+					dialog = dialog[len(ctx_dialog):].lstrip()
+					break
+
+			# Only keep non-empty dialog
+			if dialog:
+				filtered_output.append(f"{speaker}: {dialog}")
+
+		return '\n'.join(filtered_output)
+
+	def parse_batch_text(self, raw_output, prompt_data, request_speaker_map):
+		"""Extracts and filters bot responses, ensuring structured and valid output."""
+
+		def append_segment(dialogues, speaker, segment):
+			"""Append text to a speaker's dialogue, ensuring no duplicate segments."""
+
+			segment = self.strip_outer_quotes(segment)
+			
+			if speaker not in dialogues:
+				dialogues[speaker] = []	 # Store as a list, NOT a string
+
+			# Prevent duplicate entries
+			if not dialogues[speaker] or dialogues[speaker][-1] != segment:
+				dialogues[speaker].append(segment)
+
+		raw_output = self.clean_raw_output(raw_output)
+
+		if not raw_output:
+			debug_print("LLM Mansger: No raw_output, nothing to parse. Aborting.", color="red")
+			return [], []	# Return empty responses if no text
+
+		# Extract required data
+		speaker_names = prompt_data.get("speaker_names", [])
+		member_names = prompt_data.get("member_names", [])
+		llm_channel = prompt_data.get("llm_channel", [])
+		new_messages_text = prompt_data.get("new_messages", "")
+
+		# Create regex for name markers
+		valid_speaker_pattern = "|".join(map(re.escape, sorted(set(speaker_names), key=len, reverse=True)))
+		valid_member_pattern  = "|".join(map(re.escape, sorted(set(member_names), key=len, reverse=True)))
+
+		# Match name markers properly:
 		name_marker_regex = re.compile(
-			rf"(?:\b(?P<valid>{valid_pattern}):\s*)"  # Valid name markers (speaker or known names)
-			r"|(?:\b(?P<guess>\w+):\s*)"			  # Guessed (single-word) name markers
+			rf"(?:\b(?P<valid>{valid_speaker_pattern}):\s*)"	# valid speakers anywhere
+			rf"|(?:\b(?P<guess>{valid_member_pattern}):\s*)"	# valid member names anywhere
+			rf"|(?:^\s*(?P<multi>\w+\s+\w+):\s*)"				# unknown multi-word markers ONLY if exactly 2 words at line start
+			rf"|(?:^\s*(?P<single>\w+):\s*)",					# unknown single-word markers only at line start
+			re.MULTILINE
 		)
 
-		# === Step 3: Process Text to Remove Name Markers ===
-		filtered_text = []
+		first_line = raw_output.strip().split("\n")[0]
+		failed_start = False
+		if not name_marker_regex.match(first_line):
+			if len(speaker_names) == 1:
+				# Safe case: only one speaker
+				raw_output = f"{speaker_names[0]}: {raw_output.strip()}"
+			else:
+				# Ambiguous case: multiple speakers but no valid marker, store result for checking after removing echoes
+				failed_start = True
+
+		raw_output = self.remove_echoes(raw_output, new_messages_text)
+
+		if failed_start:
+			first_line = raw_output.strip().split("\n")[0]
+			if not name_marker_regex.match(first_line):
+				debug_print("Output rejected - Missing speaker marker in multi-speaker context.", color="red")
+				return [], []  # Invalid output
+
+		# Prune invalid output from the bottom up
+		lines = raw_output.strip().split("\n")
+		last_valid_idx = None
+
+		for i in reversed(range(len(lines))):
+			if name_marker_regex.match(lines[i]):
+				last_valid_idx = i
+				break
+
+		if last_valid_idx is not None:
+			lines = lines[:last_valid_idx + 1]
+			raw_output = "\n".join(lines)
+
+		raw_output = self.trim_to_last_punctuation(raw_output).strip()
+		raw_output = self.correct_misspelled_names(raw_output, member_names)
+		debug_print("Corrected raw output for parsing:")
+		debug_print(raw_output, color="dark_cyan", quiet=True)
+
+		# Process Text & Extract Dialogues ===
+		dialogues = OrderedDict()
+		speaker_order = []
+		current_speaker = None
 		last_end = 0
-		first_non_speaker_found = False	 # Track when we find a name that isn't the speaker
 
-		for match in name_marker_regex.finditer(text):
-			# Collect text between markers
-			segment = text[last_end:match.start()].strip()
-			if segment:
-				filtered_text.append(segment)
+		for match in name_marker_regex.finditer(raw_output):
+			debug_print(f"Matched name marker [{match.group(0)}] at position {match.start()} - {match.end()}", color="yellow")
+			segment = raw_output[last_end:match.start()].strip()
 
-			# Get detected name
-			marker_name = match.group("valid") if match.group("valid") else match.group("guess")
+			if segment and current_speaker:
+				append_segment(dialogues, current_speaker, segment)
 
-			# **STOP** processing if the name is NOT the speaker
-			if marker_name.lower() != speaker.lower():
-				first_non_speaker_found = True
-				break  # Discard this marker and everything after
+			marker_name = (
+				match.group("valid")
+				or match.group("guess")
+				or match.group("multi")
+				or match.group("single")
+			)
 
-			# Move past the marker
+			if marker_name not in speaker_names:
+				debug_print(f"Stopping processing - LLM attempted to speak as <{marker_name}>", color="red")
+				last_end = len(raw_output)	# Prevent the trailing capture from reprocessing text.
+				break  # Stop parsing invalid names
+
+			speaker_order.append(marker_name)
+
+			current_speaker = marker_name
 			last_end = match.end()
 
-		# After loop, add any trailing dialogue if we never stopped early
-		if not first_non_speaker_found and last_end < len(text):
-			filtered_text.append(text[last_end:].strip())
+		if current_speaker and last_end < len(raw_output):
+			append_segment(dialogues, current_speaker, raw_output[last_end:].strip())
 
-		# === Step 4: Final Cleanup ===
-		result = " ".join(filtered_text).strip()
-		speaker_lower = speaker.lower()
+		return dialogues, speaker_order
 
-		# **Extra Fix: Remove trailing name artifacts like `Zyria:Zyria:Zyria:Zyria:`
-		result = re.sub(rf"\b{valid_pattern}:\s*", "", result)
+	def apply_delays_to_dialogues(self, dialogues, speaker_order, request_speaker_map):
+		"""Applies response delays and embedded delay tags to dialogues."""
+		speaker_names = list(request_speaker_map.values())
+		response_delays = {}
 
-		# === Step 5: Special Cases ===
+		# 1. Build a global schedule: each entry represents one dialogue segment.
+		# We'll replace each dialogue line with its split segments.
+		global_schedule = []  # Each entry: {"speaker": speaker, "line": segment}
+		speaker_counter = {speaker: 0 for speaker in speaker_names}
 
-		# Abort if LLM is being weird with things like: [\quote]
-		if re.search(r"\[\\.*\]", result):
-			logger.debug(f"filter_text: Found malformed content in '{result}'. Discarding.")
-			return ""
+		for speaker in speaker_order:
+			# Only process if this speaker has an available dialogue line.
+			if speaker in dialogues and speaker_counter[speaker] < len(dialogues[speaker]):
+				original_line = dialogues[speaker][speaker_counter[speaker]]
+				if original_line.strip():
+					# Use a random min_length parameter as before.
+					min_length = random.uniform(25, 50)
+					processed_line = self.insert_split_markers(original_line, min_length)
+					# Split the processed line on the marker. We expect markers to be '|'
+					segments = processed_line.split("|")
+					# Add each non-empty segment as its own entry.
+					for segment in segments:
+						seg = segment.strip()
+						if seg:
+							global_schedule.append({
+								"speaker": speaker,
+								"line": seg
+							})
+				speaker_counter[speaker] += 1
 
-		# Abort if talking about self in 3rd person
-		pattern = rf"^[\W\s]*{re.escape(speaker_lower)}[\W\s]+.*"
-		if re.match(pattern, result.lower()):
-			logger.debug(f"filter_text: '{speaker} is talking about self in 3rd person. Discarding.")
-			return ""
+		# 2. Compute a global timestamp for each dialogue segment.
+		# Compute first line typing delay
+		first_line_typing_delay = self.context_manager.calculate_typing_delay(global_schedule[0]["line"], thinking=True) if global_schedule else 0.0
 
-		# Abort if repeating context
-		if f"{speaker}:{result}" in context:
-			logger.debug(f"filter_text: '{speaker}:{result}' already exists in context. Discarding.")
-			return ""
-		
-		if not self.is_valid_parentheses(result):	# Block corrupted output
-			return ""
+		global_time = first_line_typing_delay  # Shift everything forward by first line's delay
 
-		result = re.sub(r'\s+', ' ', result)  # Collapse spaces again
-		return result.strip()
+		for i, entry in enumerate(global_schedule):
+			if i == 0:
+				entry["global_time"] = first_line_typing_delay
+			else:
+				gap = self.context_manager.calculate_typing_delay(entry["line"], thinking=True)
+				entry["global_time"] = global_schedule[i - 1]["global_time"] + gap
 
-	def is_valid_parentheses(self, text):
-		""" Returns False if the parentheses count is invalid. """
-		open_count = text.count("(")
-		close_count = text.count(")")
-		
-		# Must be a matching pair and at most 2 total
-		return open_count == close_count and open_count <= 1  
+		# 3. For each speaker, collect the global times for their segments.
+		speaker_times = {speaker: [] for speaker in speaker_names}
+		for entry in global_schedule:
+			speaker_times[entry["speaker"]].append(entry["global_time"])
+
+		# 4. Now determine, per speaker, the delay tag for each segment.
+		# The rule: For a given segment, if the speaker appears again later, its delay tag is the difference
+		# between the next segment's global time and this segment's global time. Otherwise, delay is 0.
+		modified_dialogues = {speaker: [] for speaker in speaker_names}
+		speaker_response_delay = {}
+
+		# Build a per-speaker list of entries (from the global schedule) to compute delays.
+		per_speaker_entries = {speaker: [] for speaker in speaker_names}
+		for entry in global_schedule:
+			sp = entry["speaker"]
+			per_speaker_entries[sp].append({
+				"line": entry["line"],
+				"global_time": entry["global_time"]
+			})
+
+		for speaker, entries in per_speaker_entries.items():
+			for i, data in enumerate(entries):
+				if i < len(entries) - 1:
+					delay_tag = entries[i + 1]["global_time"] - data["global_time"]
+				else:
+					delay_tag = 0.0
+				# Append the delay tag (in ms) to the segment.
+				modified_line = data["line"] + f"[DELAY:{int(delay_tag * 1000)}]"
+				modified_dialogues[speaker].append(modified_line)
+			# The initial delay for the speaker is the global time of their first segment.
+			if entries:
+				speaker_response_delay[speaker] = entries[0]["global_time"]
+			else:
+				speaker_response_delay[speaker] = 0.0
+
+		final_responses = {
+			request_id: {
+				"speaker_name": request_speaker_map[request_id],
+				"speaker_response": "|".join(modified_dialogues.get(request_speaker_map[request_id], [])),
+				"response_delay": speaker_response_delay.get(request_speaker_map[request_id], 0.0)
+			}
+			for request_id in request_speaker_map.keys()
+		}
+
+		return final_responses
 
 	def trim_to_last_punctuation(self, text):
 		"""
-		Trims text backwards to the last punctuation (. ! ?) if extra words follow it.
-		If no punctuation exists, return an empty string.
+		Trims text backwards from the end to the first encountered terminating punctuation 
+		(".", "!", "?") or newline, whichever comes first.
+		
+		Returns the substring up to and including that punctuation/newline.
+		If no such character is found, returns an empty string.
 		"""
-		if not text.strip():  # Handle empty or whitespace-only input
+		text = text.rstrip()  # Remove trailing whitespace but not internal newlines
+		if not text:
 			return ""
+		
+		# Iterate backwards through the text
+		for i in range(len(text) - 1, -1, -1):
+			if text[i] in ".!?\n":
+				# Return text up to and including this character
+				return text[:i + 1]
+		
+		# No terminal punctuation or newline found
+		return ""
 
-		# Find the last occurrence of a sentence-ending punctuation
-		match = re.search(r'[.!?](?!.*[.!?])', text)  # Find the LAST terminal punctuation
-		if match:
-			return text[:match.end()].strip()  # Trim everything after it
+	def insert_soft_split(self, text, max_length=200):
+		if len(text) <= max_length:
+			return text
 
-		return ""  # No punctuation found, return empty string
+		# Find the last comma before the limit
+		split_index = text.rfind(',', 0, max_length)
+
+		if split_index == -1:
+			# No soft split found; return original unmodified
+			return text
+
+		# Construct the new string with a visual split marker
+		return f"{text[:split_index].strip()}|...{text[split_index + 1:].strip()}"
 
 	def insert_split_markers(self, text, min_length=100):
 		"""
@@ -298,6 +552,18 @@ class LLMManager:
 		but only if at least min_length characters have passed since the last insertion.
 		Also, ignore periods that are preceded by another period.
 		"""
+
+		abbreviations = {"vs.", "Mr.", "Ms.", "Mrs.", "Dr.", "Prof.", "Sr.", "Jr.", "e.g.", "i.e.", "etc."}
+
+		ideal_min_length = min_length
+		total_length = len(text)
+
+		if total_length > 200:
+			if not re.findall(r'[.!?] ', text):
+				text = self.insert_soft_split(text)
+			else:
+				min_length = 20	 # Less restrictive if length exceeds WoW client limitation
+
 		i = 0
 		char_count = 0	# characters since the last insertion
 
@@ -306,37 +572,31 @@ class LLMManager:
 
 			# Check for punctuation and a following space
 			if char_count >= min_length and text[i] in ".!?" and text[i+1] == " ":
-				# If it's a period, ignore it if it's preceded by another period.
-				if text[i] == '.' and i > 0 and text[i-1] == '.':
-					i += 1
-					continue  # skip this punctuation
-				
-				# Insert the marker in place of the space
-				text = text[:i+1] + "|" + text[i+2:]
-				char_count = 0	# reset count
-				i += 1	# advance to avoid re-checking the same spot
-			else:
-				i += 1
+
+				# Check for matching abbreviation
+				for abbr in abbreviations:
+					abbr_len = len(abbr)
+					if i + 1 >= abbr_len and text[i - abbr_len + 1:i + 1].lower() == abbr.lower():
+						break  # skip, it's an abbreviation
+
+				else:
+					# If it's a period, ignore it if it's preceded by another period,
+					# unless the total lengthl exceeds WoW client limit of 200 characters.
+					if text[i] == '.' and i > 0 and text[i-1] == '.' and len(text) < 200:
+						i += 1
+						continue  # skip this punctuation
+					
+					# Insert the marker in place of the space
+					text = text[:i+1] + "|" + text[i+2:]
+
+					if (total_length - char_count) < 200:
+						min_length = ideal_min_length
+
+					char_count = 0	# reset count
+
+			i += 1	# advance to avoid re-checking the same spot
 
 		return text
-
-	def clean_single_quotes(self, text):
-		debug_print(f"clean_single_quotes - Before: {text}", color="red")
-
-		# Normalize curly apostrophes (’ -> ')
-		text = text.replace("’", "'")
-
-		# 1) Preserve single quotes **inside words** (e.g., "don't" stays intact)
-		preserved = re.sub(r"(\b\w+)'(\w+\b)", r"\1###QUOTE###\2", text)
-
-		# 2) Strip out all remaining single quotes
-		no_extras = re.sub(r"'", "", preserved)
-
-		# 3) Restore **preserved** quotes back into words
-		result = no_extras.replace("###QUOTE###", "'")
-
-		debug_print(f"clean_single_quotes - After: {result}", color="red")
-		return result
 
 	def correct_misspelled_names(self, text, known_names, threshold=80, min_length=0.8):
 		"""
@@ -348,7 +608,7 @@ class LLMManager:
 		
 		Returns: Corrected text with misspelled names fixed while preserving punctuation.
 		"""
-		debug_print(f"Looking for misspelled names in \'{text}\' out of {known_names}", color="magenta") 
+		debug_print(f"Looking for misspelled names out of {known_names}", color="magenta") 
 		words_in_text = re.findall(r"\b\w+(?:'s)?\b|\W+", text)	 # Capture words & keep punctuation separate
 		corrected_words = []
 
@@ -363,7 +623,7 @@ class LLMManager:
 			base_word = word[:-2] if is_possessive else word  # Remove 's for checking
 
 			# Skip if the base word is a valid dictionary word
-			if base_word.lower() in english_words:
+			if base_word.lower() in self.english_words:
 				corrected_words.append(word)
 				continue
 
@@ -373,6 +633,8 @@ class LLMManager:
 			# If a match is found and is above the threshold, replace it
 			if match and match[1] >= threshold and len(base_word) / len(match[0]) >= min_length:
 				corrected_name = match[0]  # Use the corrected name
+				if corrected_name != base_word:
+					debug_print(f"Corrected misspelled name \"{base_word}\" to <{corrected_name}>", color="magenta")
 				if is_possessive:
 					corrected_name += "'s"	# Restore possessive form
 				corrected_words.append(corrected_name)
@@ -380,6 +642,51 @@ class LLMManager:
 				corrected_words.append(word)  # Keep original if no match found
 
 		result =  "".join(corrected_words)	 # Join without adding extra spaces
-		debug_print(f"Corrected names result - {result}", color="magenta")
 
 		return result
+
+	def tokenize_blocked_chars(self, blocked_chars):
+		logit_bias = {}
+		
+		# Known problem sequences to check
+		additional_strings = [
+			"\\'", "\\\\'",	"\\\\\\'",		# Variations of single quote escape
+			"\\\"", "\\\\\"", "\\\\\\\"",	# Variations of double quote escape
+			"\\", "\\\\", "\\\\\\\\",		# Variations of backslash escape
+			"\\n", "\\\n", "\\\\n",			# Variations of escaped newlines
+			"\'\'", "\'\'\'", "\'\'\'\'",
+			" :", " : ", "```", "````", "`````",			# You just never know
+			"///", "////", "/////", "//////", "///////",	# what these psychos
+			"***", "****", "*****", "******", "*******",	# will try next.
+			"###", "####", "#####", "######", "#######"
+		]
+		
+		# Combine blocked characters and additional problem strings
+		expanded_chars = set(blocked_chars).union(additional_strings)
+
+		for char in expanded_chars:
+			variations = [
+				char,			# Single occurrence
+				char * 2,		# Double occurrence
+				f" {char}",		# Preceded by space
+				f"{char} ",		# Followed by space
+				f" {char} ",	# Wrapped by spaces
+				f" {char * 2}",	# Double occurance preceded by space
+				f"{char * 2} ",	# Double occurance Followed by space
+				f" {char * 2} ",# Double occurance wrapped by spaces
+				f"\\{char}"		# Prefixed with backslash
+			]
+
+			for variation in variations:
+				token_ids = self.tokenize(variation)
+
+				if isinstance(token_ids, int):
+					token_ids = [token_ids]	 # Convert single int to a list
+
+				if len(token_ids) == 1:	 # Only block if it's a single token
+					token_id = token_ids[0]
+					if token_id not in logit_bias:	# Prevent duplicates
+						logit_bias[token_id] = -100	 # Apply negative bias
+						# print(f"Blocking token {token_id} for '{variation}'")
+
+		return logit_bias

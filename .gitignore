@@ -1,40 +1,6 @@
 # Ignore everything in the venv directory
-venv/*
-
-# Include essential configuration
-!venv/pyvenv.cfg
-
-# Include the `activate` script for easy activation
-!venv/bin/activate
-!venv/bin/activate.csh
-!venv/bin/activate.fish
-
-# Ignore the contents of lib and site-packages
-venv/lib/*
-venv/lib/python*/site-packages/*
+venv/
 
 # Ignore Python cache files and logs
 __pycache__/
 *.log
-
-# Ignore everything in models/ except .gitignore
-models/*
-!models/.gitignore
-
-# Ignore everything in memory/ except .gitignore
-memory/*
-!memory/.gitignore
-
-
-# Ignore personal convenience files (delete before release)
-backup/
-old/
-wip/
-*.bak
-*.txt
-
-# Ignore all test py files
-*test.py
-
-# Always include requirements.txt
-!requirements.txt
