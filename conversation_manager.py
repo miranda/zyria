@@ -18,6 +18,7 @@ class ConversationManager:
 		self.output_max_pause_time		= int(config.get('Conversation Manager', 'OutputMaxPauseTime', fallback='5'))
 		self.fatigue_multiplier			= float(config.get('Conversation Manager', 'FatigueMultiplier', fallback='2.0'))
 		self.fatigue_reset_time			= int(config.get('Conversation Manager', 'FatigueResetTime', fallback='30'))
+		self.max_batch_size				= int(config.get('Conversation Manager', 'MaxBatchSize', fallback='6'))
 
 		self.conversation_queues = defaultdict(deque)			# Incoming requests per llm_channel
 		self.conversation_locks = defaultdict(threading.Lock)	# Per-channel locks
@@ -39,6 +40,15 @@ class ConversationManager:
 		self.last_speak_time = {}		# Tracks last speaking time for each bot
 		self.last_batch_added = {}		# Tracks the sender and message of the last request added to queue
 		self.completed_request_count = {}
+
+		self.channel_thresholds = {
+			"RPG":				int(config.get("Conversation Manager", "rpg_request_threshold", fallback=2)),
+			"World":			int(config.get("Conversation Manager", "world_request_threshold", fallback=3)),
+			"Trade":			int(config.get("Conversation Manager", "default_request_threshold", fallback=4)),
+			"LocalDefense":		int(config.get("Conversation Manager", "default_request_threshold", fallback=4)),
+			"General":			int(config.get("Conversation Manager", "default_request_threshold", fallback=4)),
+			"LookingForGroup":	int(config.get("Conversation Manager", "default_request_threshold", fallback=4))
+		}
 
 		self.cancel_request_data = {
 			"mangos_response": {
@@ -92,6 +102,28 @@ class ConversationManager:
 		with self.queues_lock:
 			return [channel for channel, queue in self.conversation_queues.items() if queue]
 
+	def is_channel_overloaded(self, llm_channel):
+		"""Checks if the given channel is overloaded based on configured thresholds."""
+		# Detect channel type by prefix
+		channel_type = None 
+
+		for prefix in self.channel_thresholds.keys():
+			if llm_channel.startswith(prefix):
+				channel_type = prefix
+				break
+
+		if not channel_type:
+			return False
+
+		threshold = self.channel_thresholds.get(channel_type, None)
+
+		# Count requests for that specific channel
+		with self.queues_lock:
+			queue = self.conversation_queues.get(llm_channel, [])
+			request_count = sum(1 for request in queue if request["status"] in ("pending", "processing"))
+
+		return request_count >= threshold
+
 	def is_suspended(self, llm_channel):
 		"""Returns True if the conversation queue for the given channel's input is suspended."""
 		with self.queues_lock:
@@ -134,6 +166,7 @@ class ConversationManager:
 			pending_requests = []
 			batch_sender_type = None
 			batch_message_type = None
+			batch_size = 0
 
 			for request in queue:
 				if request.get("status") != "pending":
@@ -157,12 +190,16 @@ class ConversationManager:
 					pending_requests.append(request)
 					batch_sender_type = current_sender_type
 					batch_message_type = current_message_type
+					batch_size = 1
 					continue
 
 				# Check if request can be added to current batch
 				if (current_sender_type == batch_sender_type and 
 					current_message_type == batch_message_type):
 					pending_requests.append(request)
+					batch_size += 1
+					if batch_size >= self.max_batch_size:
+						break
 				else:
 					# Different sender or message type, stop collecting
 					break
@@ -245,9 +282,11 @@ class ConversationManager:
 					continue
 
 				time_created = request.get("time_created", 0)
+				message_type = request.get("message_type", "unknown")
 				sender_type = request.get("sender", {}).get("type", "Unknown")
 				sender_name = request.get("sender_name", "Unknown")
 				speaker_name = request.get("speaker_name", "Unknown")
+				member_names = request.get("member_names", [])
 				response_text = (request.get("mangos_response") or {}).get("text", "")
 				response_delay = request.get("response_delay", 0.0)
 
@@ -273,6 +312,9 @@ class ConversationManager:
 						expire_time = last_word + (effective_fatigue if (response_text and sender_type != "player") else 0)
 						debug_print(f"Updating busy expire time for <{speaker_name}> (fatigue: {effective_fatigue:.2f} seconds)", color="dark_magenta")
 						self.set_bot_busy(speaker_name, delay=expire_time)
+						if message_type == "rpg" and self.is_bot_busy(sender_name) and self.get_bot_remaining_busy_time(sender_name) == float('inf'):
+							debug_print(f"Updating busy expire time for <{sender_name}> to match <{speaker_name}> (RPG)", color="dark_magenta")
+							self.set_bot_busy(sender_name, delay=expire_time)
 
 					# ✅ Dispatch
 					logger.info(f"✅ Found completed request {request_id} in {llm_channel} for <{speaker_name}>")

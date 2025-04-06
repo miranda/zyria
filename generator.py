@@ -100,13 +100,14 @@ class Generator:
 					requests.extend(more_requests)
 
 			self.batch_generate(requests)
+			time.sleep(0.1)
 
 	def rpg_generator_loop(self):
 		"""Continuously fetches and processes RPG requests every 1 second."""
 		while True:
 			for llm_channel in self.conversation_manager.get_active_channels():
 				if not llm_channel.startswith("RPG"):
-					continue  # ✅ Skip non-RPG channels
+					continue  # Skip non-RPG channels
 
 				requests, message_type = self.conversation_manager.fetch_pending_rpg_requests(llm_channel)
 				if requests:
@@ -118,7 +119,7 @@ class Generator:
 					else:
 						logger.error("❌ ERROR: Attempted to process more than one RPG request simultaneously.")
 
-			time.sleep(1.5)	 # ✅ Poll RPG channels every 1.5 seconds
+			time.sleep(1.5)	 # Poll RPG channels every 1.5 seconds
 
 	def extract_details(self, entity_data, entity_type="player"):
 		""" Extracts common entity attributes, adding extra fields for players and NPCs. """
@@ -296,6 +297,9 @@ class Generator:
 		else:
 			debug_print(f"Final request speaker map for senders {sender_names}:\n{json.dumps(request_speaker_map, indent=4)}", color="dark_cyan")
 
+		# Construct string for removing echoes during LLM output parsing
+		new_messages_text = "\n".join([f"{sender}: {msg}" for _, sender, msg, _ in new_messages])
+
 		# Build the prompt with PromptBuilder
 		prompt = self.prompt_builder.build_prompt(
 			llm_channel=llm_channel,
@@ -307,8 +311,6 @@ class Generator:
 			expansion=expansion,
 			new_messages=new_messages
 		)
-
-		new_messages_text = "\n".join([f"{sender}: {msg}" for _, sender, msg, _ in new_messages])
 
 		# Construct the payload
 		request_payload = {
@@ -326,7 +328,7 @@ class Generator:
 
 	def rpg_generate(self, requests_list):
 		"""Generates responses for a batch of bot messages"""
-		debug_print(f"rpg_generate() called with request IDs {[r.get('request_id') for r in requests_list]}", color="magenta")
+		debug_print(f"rpg_generate() called with request IDs {[r.get('request_id') for r in requests_list]}", color="dark_magenta")
 
 		if not requests_list:
 			logger.warning("rpg_generate() received an empty request list.")
@@ -345,11 +347,11 @@ class Generator:
 		bot_details = data.get("bot", {})
 		npc_details = data.get("npc", {})
 		expansion = data.get("expansion", 1)
+		channel_members = data.get("channel_members", {})
 		rpg_triggers = data.get("rpg_triggers", {})
 		chat_topic = data.get("chat_topic", "general")
 		llm_channel = data.get("llm_channel", None)
-		message = data.get("message", "")
-		debug_print(f"[rpg_generate] chat_topic = {chat_topic}", color="magenta")
+		member_names = list(channel_members.keys())
 
 		bot_data = self.extract_details(bot_details)
 		bot_update = bot_data.copy()
@@ -363,6 +365,11 @@ class Generator:
 		sender_name, speaker_name = (npc_name, bot_name) if speaker_role == "bot" else (bot_name, npc_name)
 		# Store request_id -> speaker_name mapping
 		request_speaker_map = {request_id: speaker_name}
+
+		recent_context, _ = self.context_manager.get_context(llm_channel, lines=2, new_messages=[])
+		if not recent_context:
+			self.context_manager.add_message(llm_channel, npc_name, f"Greetings, {bot_name}.", 0)
+			recent_context, _ = self.context_manager.get_context(llm_channel, lines=2, new_messages=[])
 
 		# Build the prompt with PromptBuilder
 		prompt = self.prompt_builder.build_rpg_prompt(
@@ -381,13 +388,14 @@ class Generator:
 			"prompt_data": {
 				"prompt": prompt,
 				"speaker_names": [(bot_name if speaker_role == "bot" else npc_name)],
-				"member_names": [bot_name, npc_name],
-				"llm_channel": llm_channel
+				"member_names": member_names,
+				"llm_channel": llm_channel,
+				"chat_topic": chat_topic,
+				"new_messages": recent_context
 			},
-			"priority": 3,
 			"request_speaker_map": request_speaker_map
 		}
-		self.llm_manager.queue_request(request_payload)
+		self.llm_manager.queue_rpg_request(request_payload)
 
 	def filter_and_transform(self, text, speaker, other_names):
 		# helper functions

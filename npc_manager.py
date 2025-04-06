@@ -61,7 +61,8 @@ class NPCManager:
 			"lore": f"{bot_name} wants to ask {npc_name} about lore they know about.",
 			"events": f"{bot_name} wants to ask {npc_name} about recent events.",
 			"npcs": f"{bot_name} wants to ask {npc_name} about nearby NPCs.",
-			"general": f"{bot_name} wants to have a chat with {npc_name}."
+			"general": f"{bot_name} wants to have a chat with {npc_name}.",
+			"goodbye": f"{bot_name} has to go. Say goodbye."
 		}
 
 		return topic_map.get(chat_topic, topic_map["general"])
@@ -72,8 +73,7 @@ class NPCManager:
 			"end_quest": f"{bot_name} has just finished a quest for {npc_name}.",
 			"repair": f"{npc_name} can repair {bot_name}'s broken equipment.",
 			"sell": f"{bot_name} has items {npc_name} will buy.",
-			"buy": f"{npc_name} has items {bot_name} wants to buy.",
-			"goodbye": f"{bot_name} has to go. Say goodbye."
+			"buy": f"{npc_name} has items {bot_name} wants to buy."
 		}
 
 		lines = [

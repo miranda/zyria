@@ -117,12 +117,19 @@ class PromptBuilder:
 
 		# Get pre-prompt template
 		pre_prompt_key_map = {
-			"in guild chat": "PrePromptGuild",
-			"in party chat": "PrePromptParty",
-			"in raid chat": "PrePromptRaid",
-			"in private message": "PrePromptWhisper",
+			"in guild chat":				"PrePromptGuild",
+			"in party chat":				"PrePromptParty",
+			"in raid chat":					"PrePromptRaid",
+			"in private message":			"PrePromptWhisper",
+			"in world chat":				"PrePromptChannel",
+			"in the general channel":		"PrePromptChannel",
+			"in the trade channel":			"PrePromptChannel",
+			"in looking for group":			"PrePromptChannel",
+			"in the local defence channel": "PrePromptChannel",
+			"in the world defence channel": "PrePromptChannel",
+			"in guild recruitement":		"PrePromptChannel"
 		}
-		pre_prompt_key = pre_prompt_key_map.get(channel_label)
+		pre_prompt_key = pre_prompt_key_map.get(channel_label, None)
 		if pre_prompt_key is None:
 			pre_prompt_key = "PrePromptDirectSingle" if single_speaker else "PrePromptDirectMulti"
 
@@ -150,10 +157,13 @@ class PromptBuilder:
 				sender_prompt_key = f"PromptSingleSender{message_part}"
 			else:
 				sender_prompt_key = "PromptMultiSenderMultiMessage"
-			
-			sender_prompt = "\n\n" + self.format_template(self.get_prompt(sender_prompt_key), format_kwargs)
-			if sender_info_text:
-				sender_prompt += "\n\n" + self.format_template(self.get_prompt("PromptSenderDetails"), format_kwargs)
+
+			if not llm_channel.startswith(("World", "Trade", "LocalDefense", "General", "LookingForGroup")):
+				sender_prompt = "\n\n" + self.format_template(self.get_prompt(sender_prompt_key), format_kwargs)
+				if sender_info_text:
+					sender_prompt += "\n\n" + self.format_template(self.get_prompt("PromptSenderDetails"), format_kwargs)
+			else:
+				sender_prompt = ""
 
 			core_prompt += sender_prompt + speaker_prompt
 		else:
@@ -216,8 +226,6 @@ class PromptBuilder:
 		)
 
 		context, _ = self.context_manager.get_context(llm_channel, lines=self.get_max_context_lines(llm_channel))
-		if not context:
-			context = f"Greetings, {bot_name}."
 
 		# --- NPC Data formatting ---
 		formatted_bot_data = {f"bot_{key}": value for key, value in bot_data.items()}
@@ -229,14 +237,8 @@ class PromptBuilder:
 		rpg_trigger_text = self.npc_manager.get_rpg_triggers_formatted(bot_name, npc_name, rpg_triggers)
 		chat_topic_text = self.npc_manager.get_chat_topic_formatted(bot_name, npc_name, chat_topic)
 
-		debug_print(f"[build_rpg_prompt] chat_topic_text = {chat_topic_text}", color="green")
-
 		# --- NPC Info block with safe join ---
 		npc_info_text = "\n\n".join(filter(None, [npc_roles_text, rpg_trigger_text]))
-
-		debug_print("npc_roles_text:", npc_roles_text, color="magenta")
-		debug_print("rpg_trigger_text:", rpg_trigger_text, color="magenta")
-		debug_print("npc_info_text:", npc_info_text, color="magenta")
 
 		# --- Template kwargs ---
 		format_kwargs = {
@@ -265,7 +267,7 @@ class PromptBuilder:
 		chat_topic_prompt = "\n\n" + self.format_template(self.get_prompt("PromptRpgChatTopic"), format_kwargs)
 
 		# Post-prompt
-		if rpg_triggers["goodbye"]:
+		if chat_topic == "goodbye":
 			post_prompt_template = self.get_prompt("PostPromptRpgGoodbye")
 		else:
 			post_prompt_template = self.get_prompt("PostPromptRpg")

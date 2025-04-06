@@ -12,6 +12,7 @@ import nltk
 from nltk.corpus import words
 import unicodedata
 import itertools
+import time
 
 class LLMManager:
 	def __init__(self, config, *, context_manager, response_callback):
@@ -24,6 +25,12 @@ class LLMManager:
 		self.tokens_dialog_factor	 = float(config.get('LLM Manager', 'TokensDialogFactor', fallback='1.5'))
 		self.min_tokens				 = int(config.get('LLM Manager', 'MinTokens', fallback='50'))
 		self.max_tokens				 = int(config.get('LLM Manager', 'MaxTokens', fallback='150'))
+		self.max_rpg_request_age	 = float(config.get('LLM Manager', 'MaxRpgRequetAge', fallback='15.0'))
+		self.rpg_virtual_speakers	 = int(config.get('LLM Manager', 'RpgVirtualSpeakers', fallback='2'))
+		self.main_queue_size		 = int(config.get('LLM Manager', 'MainQueueSize', fallback='100'))
+		self.rpg_queue_size			 = int(config.get('LLM Manager', 'RpgQueueSize', fallback='20'))
+		
+		self.rpg_text_cache = {}	# Text cache for RPG conversations to reduce LLM calls
 
 		self.model = Llama(
 			model_path=config.get('LLM Manager', 'ModelPath'),
@@ -39,13 +46,19 @@ class LLMManager:
 		self.english_words = set(words.words())
 
 		# Set a maxsize of 100 for our priority queue.
-		self.queue = queue.PriorityQueue(maxsize=100)
-		self.lock = threading.Lock()
+		self.queue = queue.PriorityQueue(maxsize=self.main_queue_size)	# Main queue
+		self.rpg_queue = queue.Queue(maxsize=self.rpg_queue_size)		# RPG queue (FIFO)
+		self.queue_lock = threading.Lock()				# for queue management (purge, put)
+
+		self.request_counter = itertools.count()
+		self.llm_lock = threading.Lock()	 # for LLM exclusive access
+
 		self.worker_thread = threading.Thread(target=self.process_queue, daemon=True)
 		self.worker_thread.start()
-		self.request_counter = itertools.count()
-		
-		self.queued_bot_dialog = {}	 # Maps (llm_channel, marker_name) -> {"text": ..., "timestamp": ...}
+
+		self.rpg_worker_thread = threading.Thread(target=self.process_rpg_queue, daemon=True)
+		self.rpg_worker_thread.start()
+		self.last_main_process_time = time.time()
 
 	def update_words(self):
 		try:
@@ -75,7 +88,7 @@ class LLMManager:
 
 		logger.info(f"Queueing request batch {request_speaker_map} - Priority {priority}")
 
-		with self.lock:
+		with self.queue_lock:
 			# If the queue is full, purge lowest priority requests.
 			if self.queue.qsize() >= self.queue.maxsize:
 				# Get current items (thread-safe under lock)
@@ -114,6 +127,92 @@ class LLMManager:
 			# ✅ Add new request to queue
 			self.queue.put((priority, next(self.request_counter), prompt_data, request_speaker_map))
 
+	def queue_rpg_request(self, request_payload):
+		"""Queues an RPG request, handles full queue with proper cancellation."""
+		prompt_data = request_payload["prompt_data"]
+		request_speaker_map = request_payload["request_speaker_map"]
+
+		if self.rpg_queue.full():
+			logger.debug("RPG queue full, cancelling request cleanly.")
+			self.cancel_response(request_speaker_map, finish_reason="rpg_queue_full")
+			return
+
+		logger.info(f"Queueing RPG request batch {request_speaker_map}")
+		self.rpg_queue.put(request_payload)
+
+	def process_queue(self):
+		"""Processes the queue, sending requests to the LLM"""
+		while True:
+			time.sleep(0.1)			
+			try:
+				queue_size = self.queue.qsize()
+				if queue_size > 0:
+					debug_print(f"Queue length: {queue_size} pending requests.", color="yellow")
+
+				priority, batch_id, prompt_data, request_speaker_map = self.queue.get()
+				debug_print(f"Processing request batch {request_speaker_map} - Priority {priority}")
+
+				start_time = time.time()
+				self.last_main_process_time = start_time
+				with self.llm_lock:
+					response_dict = self.call_llm(prompt_data, request_speaker_map)
+				elapsed = time.time() - start_time
+
+				debug_print(f"LLM inference completed in {elapsed:.2f} seconds.", color="dark_green")
+
+				# Send back responses to server via callback
+				self.response_callback(response_dict)
+
+				# Mark task as completed
+				self.queue.task_done()
+
+			except Exception as e:
+				logger.error(f"Error processing queue - {e}")
+				logger.error(traceback.format_exc())  # ✅ Print full stack trace
+
+	def process_rpg_queue(self):
+		"""Processes the RPG queue in FIFO order, skips old requests based on time_received."""
+		while True:
+			queue_size_check = self.queue.qsize()
+			time.sleep(5.0)
+			time_since_main_process = time.time() - self.last_main_process_time
+			try:
+				# Skip RPG processing if the main queue is still busy
+				if (queue_size_check > 0 or self.queue.qsize() > 0 or time_since_main_process < 5.0):
+					continue  # Main queue takes priority
+
+				if not self.rpg_queue.empty():
+					queue_size = self.rpg_queue.qsize()
+					debug_print(f"RPG queue length: {queue_size} pending requests.", color="yellow")
+
+				request_payload = self.rpg_queue.get()
+				request_speaker_map = request_payload["request_speaker_map"]
+				time_received = request_payload.get("time_received", time.time())
+
+				if time.time() - time_received > self.max_rpg_request_age:
+					logger.debug("RPG request too old, cancelling cleanly.")
+					self.cancel_response(request_speaker_map, finish_reason="rpg_request_stale")
+					self.rpg_queue.task_done()
+					continue
+
+				prompt_data = request_payload["prompt_data"]
+
+				debug_print(f"Processing RPG request batch {request_speaker_map}")
+
+				start_time = time.time()
+				with self.llm_lock:
+					response_dict = self.call_llm(prompt_data, request_speaker_map)
+				elapsed = time.time() - start_time
+
+				debug_print(f"RPG LLM inference completed in {elapsed:.2f} seconds.", color="dark_green")
+
+				self.response_callback(response_dict)
+				self.rpg_queue.task_done()
+
+			except Exception as e:
+				logger.error(f"Error processing RPG queue - {e}")
+				logger.error(traceback.format_exc())
+
 	def cancel_response(self, request_speaker_map, finish_reason="stop"):
 		"""
 		Cancels a response and returns an empty response dictionary.
@@ -132,27 +231,6 @@ class LLMManager:
 
 		return response_dict  # Return correctly structured response dictionary
 
-	def process_queue(self):
-		"""Processes the queue, sending requests to the LLM"""
-		while True:
-			try:
-				# Get next request from queue
-				priority, batch_id, prompt_data, request_speaker_map = self.queue.get()
-				debug_print(f"Processing request batch {request_speaker_map} - Priority {priority}")
-
-				# Send prompt data to LLM
-				response_dict = self.call_llm(prompt_data, request_speaker_map)
-
-				# Send back responses to server via callback
-				self.response_callback(response_dict)
-
-				# Mark task as completed
-				self.queue.task_done()
-
-			except Exception as e:
-				logger.error(f"Error processing queue - {e}")
-				logger.error(traceback.format_exc())  # ✅ Print full stack trace
-
 	def estimate_tokens(self, num_speakers): 
 		"""
 		Estimate token budget based on number of speakers and expected dialog complexity.
@@ -162,6 +240,15 @@ class LLMManager:
 		estimate = int(num_speakers * self.base_tokens_per_speaker * self.tokens_dialog_factor)
 		return max(self.min_tokens, min(estimate, self.max_tokens))
 
+	def is_rpg_cache_waiting(self, llm_channel):
+		"""Check if cached RPG text is waiting to be used."""
+		if llm_channel.startswith("RPG") and llm_channel in self.rpg_text_cache:
+			cached_text = self.rpg_text_cache.get(llm_channel, "")
+			if cached_text:
+				return True
+
+		return False
+
 	def call_llm(self, prompt_data, request_speaker_map):
 		"""Generates responses from the LLM for multiple speakers in a batch."""
 
@@ -169,20 +256,29 @@ class LLMManager:
 		llm_channel = prompt_data["llm_channel"]
 		member_names = prompt_data["member_names"]
 		num_speakers = len(request_speaker_map)
-		max_tokens = self.estimate_tokens(num_speakers)
+		is_rpg = llm_channel.startswith("RPG")
+		max_tokens = self.estimate_tokens(num_speakers if not is_rpg else self.rpg_virtual_speakers)
 
 		try:
+			result = None
+			# Attempt to use cached RPG text if valid instead of calling LLM
+			if llm_channel.startswith("RPG") and llm_channel in self.rpg_text_cache:
+				if prompt_data.get("chat_topic", "") != "goodbye":
+					cached_text = self.rpg_text_cache.pop(llm_channel, "")
+					if cached_text:
+						result = self.simulate_llm_cached_response(cached_text)
 
-			# 🚀 Call LLM with the formatted prompt
-			result = self.model(
-				prompt=prompt,
-				max_tokens=max_tokens,
-				logit_bias=self.logit_bias,
-#				temperature=0.6,		 # Lower randomness
-#				top_k=40,				 # Limits word choices
-#				top_p=0.8,				 # Probability mass filtering
-#				repeat_penalty=1.2,
-			)
+			if not result:
+				# Call LLM with the formatted prompt
+				result = self.model(
+					prompt=prompt,
+					max_tokens=max_tokens,
+					logit_bias=self.logit_bias,
+#					temperature=0.6,		 # Lower randomness
+#					top_k=40,				 # Limits word choices
+#					top_p=0.8,				 # Probability mass filtering
+#					repeat_penalty=1.2,
+				)
 
 			choice = result['choices'][0] if 'choices' in result and result['choices'] else {}
 			finish_reason = choice.get('finish_reason', '')
@@ -282,6 +378,10 @@ class LLMManager:
 		"""
 		Removes echoed prefixes from raw_output lines if they start with a dialog from context.
 		"""
+		# Automatically split context_lines if given as a string
+		if isinstance(context_lines, str):
+			context_lines = context_lines.strip().split("\n")
+
 		def extract_dialog(line):
 			parts = line.split(":", 1)
 			return parts[1].strip() if len(parts) == 2 else ""
@@ -290,6 +390,7 @@ class LLMManager:
 
 		output_lines = raw_output.strip().split('\n')
 		filtered_output = []
+		removed_echoes = []
 
 		for line in output_lines:
 			if ":" not in line:
@@ -300,14 +401,22 @@ class LLMManager:
 			dialog = dialog.strip()
 
 			# Remove prefix if matching any context line
+			removed = False
 			for ctx_dialog in context_dialogs:
 				if dialog.startswith(ctx_dialog):
+					removed_echoes.append(line)
 					dialog = dialog[len(ctx_dialog):].lstrip()
+					removed = True
 					break
 
 			# Only keep non-empty dialog
 			if dialog:
 				filtered_output.append(f"{speaker}: {dialog}")
+
+		if removed_echoes:
+			debug_print("Removed echoes:", color="red")
+			for echo in removed_echoes:
+				debug_print(f" - {echo}", color="red")
 
 		return '\n'.join(filtered_output)
 
@@ -409,6 +518,13 @@ class LLMManager:
 
 			if marker_name not in speaker_names:
 				debug_print(f"Stopping processing - LLM attempted to speak as <{marker_name}>", color="red")
+
+				# Cache remainder if RPG channel and LLM is speaking as the opposite entity
+				if llm_channel.startswith("RPG") and marker_name in member_names:
+					remaining_text = raw_output[match.start():].strip()
+					self.rpg_text_cache[llm_channel] = remaining_text
+					debug_print(f"Cached remaining RPG text for {llm_channel}", color="cyan")
+
 				last_end = len(raw_output)	# Prevent the trailing capture from reprocessing text.
 				break  # Stop parsing invalid names
 
@@ -690,3 +806,18 @@ class LLMManager:
 						# print(f"Blocking token {token_id} for '{variation}'")
 
 		return logit_bias
+
+	def simulate_llm_cached_response(self, cached_text):
+		"""Simulate LLM call result returning cached text."""
+		result = {
+			"choices": [
+				{
+					"text": cached_text,
+					"finish_reason": "stop"
+				}
+			],
+			"usage": {
+				"completion_tokens": 1 
+			}
+		}
+		return result
