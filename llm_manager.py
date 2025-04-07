@@ -253,6 +253,7 @@ class LLMManager:
 		"""Generates responses from the LLM for multiple speakers in a batch."""
 
 		prompt = prompt_data["prompt"]
+		message_type = prompt_data["message_type"]
 		llm_channel = prompt_data["llm_channel"]
 		member_names = prompt_data["member_names"]
 		num_speakers = len(request_speaker_map)
@@ -284,7 +285,7 @@ class LLMManager:
 
 			# Process batch response for multiple speakers
 			dialogues, speaker_order = self.parse_batch_text(raw_output, prompt_data, request_speaker_map)
-			final_responses = self.apply_delays_to_dialogues(dialogues, speaker_order, request_speaker_map)
+			final_responses = self.apply_delays_to_dialogues(dialogues, speaker_order, request_speaker_map, message_type)
 			
 			response_dict = {}
 
@@ -526,7 +527,7 @@ class LLMManager:
 
 		return dialogues, speaker_order
 
-	def apply_delays_to_dialogues(self, dialogues, speaker_order, request_speaker_map):
+	def apply_delays_to_dialogues(self, dialogues, speaker_order, request_speaker_map, message_type):
 		"""Applies response delays and embedded delay tags to dialogues."""
 		speaker_names = list(request_speaker_map.values())
 		response_delays = {}
@@ -558,8 +559,11 @@ class LLMManager:
 
 		# 2. Compute a global timestamp for each dialogue segment.
 		# Compute first line typing delay
-		first_line_typing_delay = self.context_manager.calculate_typing_delay(global_schedule[0]["line"], thinking=True) if global_schedule else 0.0
-
+		first_line_typing_delay = (
+			self.context_manager.calculate_typing_delay(global_schedule[0]["line"], thinking=True)
+			if (global_schedule and message_type != "rpg")
+			else 0.0
+		)
 		global_time = first_line_typing_delay  # Shift everything forward by first line's delay
 
 		for i, entry in enumerate(global_schedule):
