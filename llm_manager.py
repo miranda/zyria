@@ -20,15 +20,15 @@ class LLMManager:
 		self.context_manager = context_manager
 		self.response_callback = response_callback	# Store callback function
 
-		self.blocked_tokens			 = config.get('LLM Manager', 'BlockedTokens', fallback='')
-		self.base_tokens_per_speaker = int(config.get('LLM Manager', 'BaseTokensPerSpeaker', fallback='30'))
-		self.tokens_dialog_factor	 = float(config.get('LLM Manager', 'TokensDialogFactor', fallback='1.5'))
-		self.min_tokens				 = int(config.get('LLM Manager', 'MinTokens', fallback='50'))
-		self.max_tokens				 = int(config.get('LLM Manager', 'MaxTokens', fallback='150'))
-		self.max_rpg_request_age	 = float(config.get('LLM Manager', 'MaxRpgRequetAge', fallback='15.0'))
-		self.rpg_virtual_speakers	 = int(config.get('LLM Manager', 'RpgVirtualSpeakers', fallback='2'))
-		self.main_queue_size		 = int(config.get('LLM Manager', 'MainQueueSize', fallback='100'))
-		self.rpg_queue_size			 = int(config.get('LLM Manager', 'RpgQueueSize', fallback='20'))
+		self.blocked_tokens				= config.get('LLM Manager', 'BlockedTokens', fallback='')
+		self.base_tokens_per_speaker	= int(config.get('LLM Manager', 'BaseTokensPerSpeaker', fallback='30'))
+		self.tokens_dialog_factor		= float(config.get('LLM Manager', 'TokensDialogFactor', fallback='1.5'))
+		self.min_tokens					= int(config.get('LLM Manager', 'MinTokens', fallback='50'))
+		self.max_tokens					= int(config.get('LLM Manager', 'MaxTokens', fallback='150'))
+		self.rpg_max_tokens				= int(config.get('LLM Manager', 'RpgMaxTokens', fallback='100'))
+		self.max_rpg_request_age		= float(config.get('LLM Manager', 'MaxRpgRequetAge', fallback='15.0'))
+		self.main_queue_size			= int(config.get('LLM Manager', 'MainQueueSize', fallback='100'))
+		self.rpg_queue_size				= int(config.get('LLM Manager', 'RpgQueueSize', fallback='20'))
 		
 		self.rpg_text_cache = {}	# Text cache for RPG conversations to reduce LLM calls
 
@@ -256,29 +256,22 @@ class LLMManager:
 		llm_channel = prompt_data["llm_channel"]
 		member_names = prompt_data["member_names"]
 		num_speakers = len(request_speaker_map)
-		is_rpg = llm_channel.startswith("RPG")
-		max_tokens = self.estimate_tokens(num_speakers if not is_rpg else self.rpg_virtual_speakers)
+		if llm_channel.startswith("RPG"):
+			max_tokens = self.min_tokens if prompt_data.get("chat_topic", "") == "goodbye" else self.rpg_max_tokens
+		else:
+			max_tokens = self.estimate_tokens(num_speakers)
 
 		try:
-			result = None
-			# Attempt to use cached RPG text if valid instead of calling LLM
-			if llm_channel.startswith("RPG") and llm_channel in self.rpg_text_cache:
-				if prompt_data.get("chat_topic", "") != "goodbye":
-					cached_text = self.rpg_text_cache.pop(llm_channel, "")
-					if cached_text:
-						result = self.simulate_llm_cached_response(cached_text)
-
-			if not result:
-				# Call LLM with the formatted prompt
-				result = self.model(
-					prompt=prompt,
-					max_tokens=max_tokens,
-					logit_bias=self.logit_bias,
+			# Call LLM with the formatted prompt
+			result = self.model(
+				prompt=prompt,
+				max_tokens=max_tokens,
+				logit_bias=self.logit_bias,
 #					temperature=0.6,		 # Lower randomness
 #					top_k=40,				 # Limits word choices
 #					top_p=0.8,				 # Probability mass filtering
 #					repeat_penalty=1.2,
-				)
+			)
 
 			choice = result['choices'][0] if 'choices' in result and result['choices'] else {}
 			finish_reason = choice.get('finish_reason', '')
@@ -442,6 +435,7 @@ class LLMManager:
 			return [], []	# Return empty responses if no text
 
 		# Extract required data
+		message_type = prompt_data.get("message_type", "Unknown")
 		speaker_names = prompt_data.get("speaker_names", [])
 		member_names = prompt_data.get("member_names", [])
 		llm_channel = prompt_data.get("llm_channel", [])
@@ -463,8 +457,8 @@ class LLMManager:
 		first_line = raw_output.strip().split("\n")[0]
 		failed_start = False
 		if not name_marker_regex.match(first_line):
-			if len(speaker_names) == 1:
-				# Safe case: only one speaker
+			if len(speaker_names) == 1 or (len(speaker_names) == 2 and message_type == "rpg"):
+				# Safe case: only one speaker, or two for RPG prompt
 				raw_output = f"{speaker_names[0]}: {raw_output.strip()}"
 			else:
 				# Ambiguous case: multiple speakers but no valid marker, store result for checking after removing echoes
@@ -518,12 +512,6 @@ class LLMManager:
 
 			if marker_name not in speaker_names:
 				debug_print(f"Stopping processing - LLM attempted to speak as <{marker_name}>", color="red")
-
-				# Cache remainder if RPG channel and LLM is speaking as the opposite entity
-				if llm_channel.startswith("RPG") and marker_name in member_names:
-					remaining_text = raw_output[match.start():].strip()
-					self.rpg_text_cache[llm_channel] = remaining_text
-					debug_print(f"Cached remaining RPG text for {llm_channel}", color="cyan")
 
 				last_end = len(raw_output)	# Prevent the trailing capture from reprocessing text.
 				break  # Stop parsing invalid names
@@ -806,18 +794,3 @@ class LLMManager:
 						# print(f"Blocking token {token_id} for '{variation}'")
 
 		return logit_bias
-
-	def simulate_llm_cached_response(self, cached_text):
-		"""Simulate LLM call result returning cached text."""
-		result = {
-			"choices": [
-				{
-					"text": cached_text,
-					"finish_reason": "stop"
-				}
-			],
-			"usage": {
-				"completion_tokens": 1 
-			}
-		}
-		return result

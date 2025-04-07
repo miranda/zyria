@@ -19,6 +19,7 @@ class ConversationManager:
 		self.fatigue_multiplier			= float(config.get('Conversation Manager', 'FatigueMultiplier', fallback='2.0'))
 		self.fatigue_reset_time			= int(config.get('Conversation Manager', 'FatigueResetTime', fallback='30'))
 		self.max_batch_size				= int(config.get('Conversation Manager', 'MaxBatchSize', fallback='6'))
+		self.rpg_pair_timeout			= int(config.get('Conversation Manager', 'RpgPairTimeout', fallback='3'))
 
 		self.conversation_queues = defaultdict(deque)			# Incoming requests per llm_channel
 		self.conversation_locks = defaultdict(threading.Lock)	# Per-channel locks
@@ -207,19 +208,57 @@ class ConversationManager:
 		return pending_requests, batch_message_type or (pending_requests[0]["message_type"] if pending_requests else None)
 
 	def fetch_pending_rpg_requests(self, llm_channel):
-		"""Fetches pending RPG requests, ensuring they are processed one at a time."""
-		with self.queues_lock:	# 🔒 Ensure thread safety
+		"""Fetches pending RPG request pairs. Cancels unpaired ones after 1 second."""
+		with self.queues_lock:
 			queue = self.conversation_queues[llm_channel]
-
 			if not queue:
-				return [], None	 # ✅ Return empty list if no RPG requests
+				return [], None
+
+			pending_requests = []
+			batch_timestamp = None
+
+			now = int(time.time() * 1000)  # Current time in ms
 
 			for request in queue:
-				if request["status"] == "pending":
-					debug_print(f"Found pending RPG request {request['request_id']}")
-					return [request], request["message_type"]  # ✅ RPG messages are handled one at a time
+				if request.get("status") != "pending" or request.get("message_type") != "rpg":
+					continue
 
-		return [], None	 # ✅ Return empty if no pending RPG requests
+				if "time_created" not in request:
+					logger.error(f"❌ ERROR: Missing 'time_created' in RPG request: {request}")
+					continue
+
+				current_timestamp = request["time_created"]
+
+				if not pending_requests:
+					pending_requests.append(request)
+					batch_timestamp = current_timestamp
+					continue
+
+				# Only match requests with the *exact* same timestamp
+				if current_timestamp == batch_timestamp:
+					pending_requests.append(request)
+					if len(pending_requests) == 2:
+						break
+				else:
+					break  # Different timestamp means not part of the same pair
+
+			if len(pending_requests) == 2:
+				debug_print(f"✅ Found RPG request pair: {[r.get('request_id') for r in pending_requests]}")
+
+				return pending_requests, "rpg"
+
+			# If we only found one, check if it's too old
+			if len(pending_requests) == 1:
+				age = now - batch_timestamp
+				if age < self.rpg_pair_timeout * 1000:
+					return [], None	 # Still within grace period
+
+				# Timeout reached — cancel it
+				orphan = pending_requests[0]
+				self.cancel_request(orphan)
+				debug_print(f"Cancelling orphaned request after RPG pairing timeout: {orphan['request_id']}", color="dark_yellow")
+
+			return [], None
 
 	def prioritize_player_message(self, llm_channel, target_speakers=None):
 		"""Prioritize player messages by clearing related bot responses, or all if target_speakers is None."""
@@ -238,20 +277,14 @@ class ConversationManager:
 				if request["status"] == "pending":
 					# Match directly by the pending request's speaker
 					if target_speakers is None or request["speaker"]["name"] in target_speakers:
-						request.update({
-							"status": "cancelled",
-							**self.cancel_request_data
-						})
+						self.cancel_request(request)
 
 				elif request["status"] == "completed":
 					# Completed responses may have been a batch, check `conversation_members`
 					speakers_involved = request.get("conversation_members", [])
 
 					if target_speakers is None or any(speaker in target_speakers for speaker in speakers_involved):
-						request.update({
-							"status": "cancelled",
-							**self.cancel_request_data
-						})
+						self.cancel_request(request)
 
 			debug_print(f"Cleared relevant bot requests in {llm_channel} to prioritize player message.", color="yellow")
 
@@ -271,7 +304,7 @@ class ConversationManager:
 		"""Fetches a completed request from the queue and removes it, enforcing pacing and updating fatigue."""
 
 		if self.is_paused(llm_channel):
-			return None	 # 🚫 Skip if queue is paused
+			return None	 # Skip if queue is paused
 
 		with self.queues_lock:
 			queue = self.conversation_queues[llm_channel]
@@ -286,7 +319,6 @@ class ConversationManager:
 				sender_type = request.get("sender", {}).get("type", "Unknown")
 				sender_name = request.get("sender_name", "Unknown")
 				speaker_name = request.get("speaker_name", "Unknown")
-				member_names = request.get("member_names", [])
 				response_text = (request.get("mangos_response") or {}).get("text", "")
 				response_delay = request.get("response_delay", 0.0)
 
@@ -312,9 +344,6 @@ class ConversationManager:
 						expire_time = last_word + (effective_fatigue if (response_text and sender_type != "player") else 0)
 						debug_print(f"Updating busy expire time for <{speaker_name}> (fatigue: {effective_fatigue:.2f} seconds)", color="dark_magenta")
 						self.set_bot_busy(speaker_name, delay=expire_time)
-						if message_type == "rpg" and self.is_bot_busy(sender_name) and self.get_bot_remaining_busy_time(sender_name) == float('inf'):
-							debug_print(f"Updating busy expire time for <{sender_name}> to match <{speaker_name}> (RPG)", color="dark_magenta")
-							self.set_bot_busy(sender_name, delay=expire_time)
 
 					# ✅ Dispatch
 					logger.info(f"✅ Found completed request {request_id} in {llm_channel} for <{speaker_name}>")
@@ -453,7 +482,7 @@ class ConversationManager:
 
 	def receive_llm_response(self, response_dict):
 		"""Handles responses from LLM and updates the corresponding requests in the queue."""
-		with self.queues_lock:	# 🔒 Ensure thread safety
+		with self.queues_lock:
 			for request_id, response_data in response_dict.items():
 				llm_channel = response_data.get("llm_channel")
 
@@ -465,39 +494,41 @@ class ConversationManager:
 				for request in queue:
 					if request["request_id"] == request_id:
 						speaker_name = response_data.get("speaker_name", "Unknown")
-						# ✅ Update it in place
+						# Update it in place
 						request.update({
 							"status": "completed",
-							"speaker_name": speaker_name,
 							"mangos_response": response_data.get("mangos_response", {}),
 							"response_delay": response_data.get("response_delay", 0)
 						})
 
 						debug_print(f"Updated request {request_id} to 'completed' for <{speaker_name}>", color="green")
-						break  # ✅ Stop once updated
+						break  # Stop once updated
 
-	def cancel_request(self, request_id, speaker_name, llm_channel, release=False):
+	def cancel_request(self, request, release=False):
 		"""Handles responses from LLM and updates the corresponding requests in the queue."""
 		with self.queues_lock:	# 🔒 Ensure thread safety
+			# Update it in place
+			request.update({
+				"status": "cancelled",
+				**self.cancel_request_data	# Merge common structure
+			})
+			speaker_name = request.get("speaker_name", "Unknown")
+			debug_print(f"Cancelled request {request['request_id']} for <{speaker_name}>", color="red")
+			if self.is_bot_busy(speaker_name):
+				if release or (self.get_bot_remaining_busy_time(speaker_name) == float('inf')):
+					self.set_bot_busy(speaker_name, delay=0)	# Release bot immediately
+
+	def cancel_by_id_channel(self, request_id, llm_channel, release=False):
+		"""Handles responses from LLM and updates the corresponding requests in the queue."""
+		with self.queues_lock:
 			queue = self.conversation_queues[llm_channel]
 			if not llm_channel or not any(req.get("request_id") == request_id for req in queue):
 				logger.error(f"❌ Failed to cancel unknown request {request_id}")
 
 			for request in queue:
 				if request["request_id"] == request_id and request["status"] != "completed":
-					# ✅ Update it in place
-					request.update({
-						"status": "cancelled",
-						"speaker_name": speaker_name,
-						**self.cancel_request_data	# Merge common structure
-					})
-					
-					debug_print(f"Cancelled request {request_id} for <{speaker_name}>", color="red")
-					if self.is_bot_busy(speaker_name):
-						if release or (self.get_bot_remaining_busy_time(speaker_name) == float('inf')):
-							self.set_bot_busy(speaker_name, delay=0)	# Release bot immediately
-
-					break  # ✅ Stop once updated
+					self.cancel_request(request, release=release)
+					break  # Stop once updated
 
 	def peek_next_request(self, llm_channel):
 		"""Returns the next request without removing it from the queue."""

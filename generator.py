@@ -109,15 +109,19 @@ class Generator:
 				if not llm_channel.startswith("RPG"):
 					continue  # Skip non-RPG channels
 
-				requests, message_type = self.conversation_manager.fetch_pending_rpg_requests(llm_channel)
-				if requests:
-					if len(requests) == 1:
-						requests[0]["status"] = "processing"
+				try:
+					requests, _ = self.conversation_manager.fetch_pending_rpg_requests(llm_channel)
+					if requests:
+						if len(requests) == 2:
+							requests[0]["status"] = "processing"
+							requests[1]["status"] = "processing"
 
-						debug_print(f"Processing RPG request {requests[0]['request_id']}", color="cyan")
-						self.rpg_generate(requests)
-					else:
-						logger.error("❌ ERROR: Attempted to process more than one RPG request simultaneously.")
+							debug_print(f"Processing RPG request {requests[0]['request_id']}", color="cyan")
+							self.rpg_generate(requests)
+						else:
+							logger.error(f"❌ ERROR: Attempted to process invalid RPG batch size ({len(requests)} requests)")
+				except Exception as e:
+					logger.exception(f"🔥 Exception while processing RPG channel '{llm_channel}': {e}")
 
 			time.sleep(1.5)	 # Poll RPG channels every 1.5 seconds
 
@@ -230,7 +234,7 @@ class Generator:
 					if prev_speaker_name == speaker_name:
 						del request_speaker_map[prev_request_id]
 						debug_print(f"Cancelling previous redundant request {request_id} for <{speaker_name}>", color="dark_cyan")
-						self.conversation_manager.cancel_request(prev_request_id, speaker_name, llm_channel)
+						self.conversation_manager.cancel_by_id_channel(prev_request_id, llm_channel)
 						break
 
 			ignore_votes = []
@@ -249,7 +253,7 @@ class Generator:
 
 			if all(ignore_votes):
 				debug_print(f"Speaker <{speaker_name}> cancelled due to attention check (ignored by all senders)", color="cyan")
-				self.conversation_manager.cancel_request(request_id, speaker_name, llm_channel, release=True)
+				self.conversation_manager.cancel_by_id_channel(request_id, llm_channel, release=True)
 				continue
 
 			# ✅ Store speaker uniquely
@@ -288,7 +292,7 @@ class Generator:
 		):
 			request_id = next(iter(request_speaker_map))
 			debug_print(f"Cancelling request {request_id} with same sender/speaker to block self-reply", color="dark_yellow")
-			self.conversation_manager.cancel_request(request_id, speaker_names[0], llm_channel, release=True)
+			self.conversation_manager.cancel_by_id_channel(request_id, llm_channel, release=True)
 			request_speaker_map = {}
 
 		if not request_speaker_map:
@@ -316,6 +320,7 @@ class Generator:
 		request_payload = {
 			"prompt_data": {
 				"prompt": prompt,
+				"message_type": message_type,
 				"speaker_names": speaker_names,
 				"member_names": member_names,
 				"llm_channel": llm_channel,
@@ -334,24 +339,19 @@ class Generator:
 			logger.warning("rpg_generate() received an empty request list.")
 			return []
 
-		if len(requests_list) > 1:
-			logger.warning("rpg_generate() received multiple requests in an RPG batch, rejecting.")
+		if len(requests_list) != 2:
+			logger.warning("rpg_generate() received invalid request batch size, rejecting.")
 			return []
 
-		# ✅ Extract first request details (assuming only one)
-		data = requests_list[0]
-
-		request_id = data.get("request_id", None)
-		message_type = data.get("message_type", "unknown")
-		speaker_role = data.get("speaker_role", "unknown")
-		bot_details = data.get("bot", {})
-		npc_details = data.get("npc", {})
-		expansion = data.get("expansion", 1)
-		channel_members = data.get("channel_members", {})
-		rpg_triggers = data.get("rpg_triggers", {})
-		chat_topic = data.get("chat_topic", "general")
-		llm_channel = data.get("llm_channel", None)
-		member_names = list(channel_members.keys())
+		# ✅ Extract first request details (assuming all requests in batch share context)
+		first_request = requests_list[0]
+		message_type = first_request.get("message_type", "unknown")
+		bot_details = first_request.get("bot", {})
+		npc_details = first_request.get("npc", {})
+		rpg_triggers = first_request.get("rpg_triggers", {})
+		chat_topic = first_request.get("chat_topic", "general")
+		expansion = first_request.get("expansion", 1)  # Default to TBC
+		llm_channel = first_request.get("llm_channel", None)
 
 		bot_data = self.extract_details(bot_details)
 		bot_update = bot_data.copy()
@@ -362,9 +362,18 @@ class Generator:
 		npc_name = npc_data["name"]
 		npc_role_info = npc_details.get("npc_options", {})
 
-		sender_name, speaker_name = (npc_name, bot_name) if speaker_role == "bot" else (bot_name, npc_name)
-		# Store request_id -> speaker_name mapping
-		request_speaker_map = {request_id: speaker_name}
+		# Initialize response mappings
+		request_speaker_map = {}  # {request_id -> speaker_name}
+
+		# Process all requests
+		for request in requests_list:
+			request_id = request.get("request_id", None)
+			speaker_role = request.get("speaker_role", "unknown")
+
+			speaker_name = bot_name if speaker_role == "bot" else npc_name
+
+			# Track request to speaker
+			request_speaker_map[request_id] = speaker_name
 
 		recent_context, _ = self.context_manager.get_context(llm_channel, lines=2, new_messages=[])
 		if not recent_context:
@@ -374,7 +383,6 @@ class Generator:
 		# Build the prompt with PromptBuilder
 		prompt = self.prompt_builder.build_rpg_prompt(
 			llm_channel=llm_channel,
-			speaker_role=speaker_role,
 			bot_data=bot_data,
 			npc_data=npc_data,
 			npc_role_info=npc_role_info,
@@ -387,8 +395,9 @@ class Generator:
 		request_payload = {
 			"prompt_data": {
 				"prompt": prompt,
-				"speaker_names": [(bot_name if speaker_role == "bot" else npc_name)],
-				"member_names": member_names,
+				"message_type": message_type,
+				"speaker_names": [bot_name, npc_name],
+				"member_names": [bot_name, npc_name],
 				"llm_channel": llm_channel,
 				"chat_topic": chat_topic,
 				"new_messages": recent_context

@@ -203,7 +203,6 @@ class PromptBuilder:
 
 	def build_rpg_prompt(self, *,
 		llm_channel,
-		speaker_role,
 		bot_data,
 		npc_data,
 		npc_role_info,
@@ -214,9 +213,6 @@ class PromptBuilder:
 		# --- Names ---
 		bot_name = bot_data.get("name", "Unknown")
 		npc_name = npc_data.get("name", "Unknown")
-
-		# --- Who is speaking? Who is listening? ---
-		speaker_name, sender_name = (bot_name, npc_name) if speaker_role == "bot" else (npc_name, bot_name)
 
 		# --- Gather dynamic data ---
 		location = self.memory_manager.format_location(
@@ -247,8 +243,6 @@ class PromptBuilder:
 			"npc_full_name": self.get_npc_full_name(npc_data),
 			"expansion": self.expansions[expansion],
 			"location": location,
-			"sender_name": sender_name,
-			"speaker_name": speaker_name,
 			"bot_info": bot_info_text,
 			"npc_info": npc_info_text,
 			"context": context,

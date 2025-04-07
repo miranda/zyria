@@ -105,8 +105,6 @@ def generate_request():
 	sender_name = speaker_sender_request_data["sender_name"]
 	speaker_name = speaker_sender_request_data["speaker_name"]
 	speaker_afk = speaker_sender_request_data["speaker_afk"]
-	channel_members = request_data.get("channel_members", {})
-	member_names = list(channel_members.keys())
 		
 	if sender_type == "player":
 		conversation_manager.prioritize_player_message(llm_channel)
@@ -114,7 +112,14 @@ def generate_request():
 		debug_print(f"Allowed request from player <{sender_name}> and released channel {llm_channel} from suspension", color="cyan")
 
 	else:
-		if conversation_manager.is_bot_busy(speaker_name):
+		speaker_busy = True if conversation_manager.is_bot_busy(speaker_name) else False
+		sender_busy = True if conversation_manager.is_bot_busy(sender_name) else False
+		if message_type == "rpg" and (speaker_busy or sender_busy):
+			remaining_speaker_busy_time = conversation_manager.get_bot_remaining_busy_time(speaker_name)
+			remaining_sender_busy_time = conversation_manager.get_bot_remaining_busy_time(sender_name)
+			debug_print(f"Rejected RPG request <{speaker_name}> busy time remaining = {remaining_speaker_busy_time}, <{sender_name}> busy time remaining = {remaining_sender_busy_time})", color="red")
+			return jsonify({"error": "RPG participant is busy"}), 400
+		elif speaker_busy:
 			# Reject request if bot is busy (ignoring new messages)
 			remaining_busy_time = conversation_manager.get_bot_remaining_busy_time(speaker_name)
 			debug_print(f"Rejected request for <{speaker_name}> (entity is busy, time remaining = {remaining_busy_time})", color="red")
@@ -131,11 +136,8 @@ def generate_request():
 					debug_print(f"Rejected request for <{speaker_name}> (LLM channel is suspended)", color="red")
 					return jsonify({"error": f"Channel {llm_channel}> is suspended"}), 400
 			elif conversation_manager.is_channel_overloaded(llm_channel):
-				if message_type == "rpg" and llm_manager.is_rpg_cache_waiting(llm_channel):
-					debug_print(f"Allowed RPG request from <{sender_name}> due to availability of cached results", color="cyan")
-				else:
-					debug_print(f"Rejected request for <{speaker_name}> (Channel {llm_channel} is overloaded)", color="red")
-					return jsonify({"error": "LLM channel is overloaded"}), 400
+				debug_print(f"Rejected request for <{speaker_name}> (Channel {llm_channel} is overloaded)", color="red")
+				return jsonify({"error": "LLM channel is overloaded"}), 400
 
 	request_id = generate_request_id(time_received)
 	request_data["request_id"] = request_id
@@ -143,7 +145,6 @@ def generate_request():
 	request_data["status"] = "pending"
 	request_data["sender_name"] = sender_name
 	request_data["speaker_name"] = speaker_name
-	request_data["member_names"] = member_names
 
 	debug_print(request_data, color={"new": "green", "reply": "yellow", "rpg": "cyan"}.get(message_type, "white"), quiet=True)
 
@@ -151,11 +152,7 @@ def generate_request():
 	conversation_manager.add_request(llm_channel, request_data)
 
 	# Mark the speaker as busy
-	if message_type == "rpg":
-		for name in member_names:
-			conversation_manager.set_bot_busy(name)
-	else:
-		conversation_manager.set_bot_busy(speaker_name)
+	conversation_manager.set_bot_busy(speaker_name)
 
 	try:
 		start_time = time.time()
