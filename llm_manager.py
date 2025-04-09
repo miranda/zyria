@@ -29,7 +29,8 @@ class LLMManager:
 		self.max_rpg_request_age		= float(config.get('LLM Manager', 'MaxRpgRequetAge', fallback='15.0'))
 		self.main_queue_size			= int(config.get('LLM Manager', 'MainQueueSize', fallback='100'))
 		self.rpg_queue_size				= int(config.get('LLM Manager', 'RpgQueueSize', fallback='20'))
-		
+		self.rpg_message_delay			= 3.5
+
 		self.rpg_text_cache = {}	# Text cache for RPG conversations to reduce LLM calls
 
 		self.model = Llama(
@@ -358,15 +359,51 @@ class LLMManager:
 		if not text:
 			return text
 
-		# Remove exactly one leading quote if present
-		if text.startswith('"'):
-			text = text[1:]
+		# Strip matching outer single quotes and return
+		if text.startswith("'") and text.endswith("'"):
+			text = text[1:-1]
+			return text
 
-		# Remove exactly one trailing quote if present
-		if text.endswith('"'):
+		# Strip nonsense stray leading single quote and return
+		if text.startswith("'"):
+			text = text[1:]
+			return text
+
+		quote_count = text.count('"')
+
+		# Strip matching outer quotes and return
+		if quote_count == 2 and text.startswith('"') and text.endswith('"'):
+			text = text[1:-1]
+			return text
+
+		# Remove stray leading quote if present
+		if text.startswith('"') and quote_count == 1:
+			text = text[1:]
+		# Remove stray trailing quote if present
+		elif text.endswith('"') and quote_count == 1:
 			text = text[:-1]
 
 		return text
+
+	def dialogue_sanity_check(self, text, speaker_name):
+		# Assume speaker is talking about self in 3rd person
+		pattern = rf"^[\W\s]*{re.escape(speaker_name)}[\W\s]+.*"
+		if re.match(pattern, text):
+			debug_print(f"<{speaker_name}> is talking about self in 3rd person", color="dark_yellow")
+			return False
+
+		quote_count = text.count('"')
+
+		# Detect LLM trying to do goofy narration-style output
+		if text.startswith('"'):
+			if text.endswith('"') and quote_count > 2:
+				debug_print(f"Detected 3rd person narration-style output for <{speaker_name}>", color="dark_yellow")
+				return False
+		
+		if "(" in text or ")" in text:
+			return False
+
+		return True
 
 	def remove_echoes(self, raw_output, context_lines):
 		"""
@@ -502,6 +539,11 @@ class LLMManager:
 			segment = raw_output[last_end:match.start()].strip()
 
 			if segment and current_speaker:
+				if not self.dialogue_sanity_check(segment, current_speaker):
+					debug_print(f"Stopping processing - LLM output for <{current_speaker}> failed sanity check", color="red")
+					last_end = len(raw_output)	# Prevent the trailing capture from reprocessing text.
+					break
+				segment = self.strip_outer_quotes(segment)
 				append_segment(dialogues, current_speaker, segment)
 
 			marker_name = (
@@ -528,26 +570,21 @@ class LLMManager:
 		return dialogues, speaker_order
 
 	def apply_delays_to_dialogues(self, dialogues, speaker_order, request_speaker_map, message_type):
-		"""Applies response delays and embedded delay tags to dialogues."""
+		"""Applies response delays and embedded delay tags to dialogues, supporting RPG and non-RPG types."""
 		speaker_names = list(request_speaker_map.values())
 		response_delays = {}
 
 		# 1. Build a global schedule: each entry represents one dialogue segment.
-		# We'll replace each dialogue line with its split segments.
 		global_schedule = []  # Each entry: {"speaker": speaker, "line": segment}
 		speaker_counter = {speaker: 0 for speaker in speaker_names}
 
 		for speaker in speaker_order:
-			# Only process if this speaker has an available dialogue line.
 			if speaker in dialogues and speaker_counter[speaker] < len(dialogues[speaker]):
 				original_line = dialogues[speaker][speaker_counter[speaker]]
 				if original_line.strip():
-					# Use a random min_length parameter as before.
 					min_length = random.uniform(25, 50)
 					processed_line = self.insert_split_markers(original_line, min_length)
-					# Split the processed line on the marker. We expect markers to be '|'
 					segments = processed_line.split("|")
-					# Add each non-empty segment as its own entry.
 					for segment in segments:
 						seg = segment.strip()
 						if seg:
@@ -557,35 +594,42 @@ class LLMManager:
 							})
 				speaker_counter[speaker] += 1
 
-		# 2. Compute a global timestamp for each dialogue segment.
-		# Compute first line typing delay
-		first_line_typing_delay = (
-			self.context_manager.calculate_typing_delay(global_schedule[0]["line"], thinking=True)
-			if (global_schedule and message_type != "rpg")
-			else 0.0
-		)
-		global_time = first_line_typing_delay  # Shift everything forward by first line's delay
+		# 2. Compute global timestamp for each segment
+		global_time = 0.0
 
-		for i, entry in enumerate(global_schedule):
-			if i == 0:
-				entry["global_time"] = first_line_typing_delay
-			else:
-				gap = self.context_manager.calculate_typing_delay(entry["line"], thinking=True)
-				entry["global_time"] = global_schedule[i - 1]["global_time"] + gap
+		if message_type == "rpg":
+			# RPG style: delay is based on the segment's own reading time
+			for i, entry in enumerate(global_schedule):
+				if i == 0:
+					entry["global_time"] = 0.0
+				else:
+					gap = self.calculate_reading_delay(entry["line"])
+					entry["global_time"] = global_schedule[i - 1]["global_time"] + gap
+		else:
+			# Non-RPG style: first line gets full typing delay; gaps are based on typing delay or fixed rpg delay
+			first_line_typing_delay = (
+				self.context_manager.calculate_typing_delay(global_schedule[0]["line"], thinking=True)
+				if global_schedule else 0.0
+			)
+			global_time = first_line_typing_delay
 
-		# 3. For each speaker, collect the global times for their segments.
+			for i, entry in enumerate(global_schedule):
+				if i == 0:
+					entry["global_time"] = first_line_typing_delay
+				else:
+					gap = self.context_manager.calculate_typing_delay(entry["line"], thinking=True)
+					entry["global_time"] = global_schedule[i - 1]["global_time"] + gap
+
+		# 3. Collect segment times per speaker
 		speaker_times = {speaker: [] for speaker in speaker_names}
 		for entry in global_schedule:
 			speaker_times[entry["speaker"]].append(entry["global_time"])
 
-		# 4. Now determine, per speaker, the delay tag for each segment.
-		# The rule: For a given segment, if the speaker appears again later, its delay tag is the difference
-		# between the next segment's global time and this segment's global time. Otherwise, delay is 0.
+		# 4. Compute [DELAY] tags and first response delay per speaker
 		modified_dialogues = {speaker: [] for speaker in speaker_names}
 		speaker_response_delay = {}
-
-		# Build a per-speaker list of entries (from the global schedule) to compute delays.
 		per_speaker_entries = {speaker: [] for speaker in speaker_names}
+
 		for entry in global_schedule:
 			sp = entry["speaker"]
 			per_speaker_entries[sp].append({
@@ -599,14 +643,9 @@ class LLMManager:
 					delay_tag = entries[i + 1]["global_time"] - data["global_time"]
 				else:
 					delay_tag = 0.0
-				# Append the delay tag (in ms) to the segment.
 				modified_line = data["line"] + f"[DELAY:{int(delay_tag * 1000)}]"
 				modified_dialogues[speaker].append(modified_line)
-			# The initial delay for the speaker is the global time of their first segment.
-			if entries:
-				speaker_response_delay[speaker] = entries[0]["global_time"]
-			else:
-				speaker_response_delay[speaker] = 0.0
+			speaker_response_delay[speaker] = entries[0]["global_time"] if entries else 0.0
 
 		final_responses = {
 			request_id: {
@@ -752,6 +791,15 @@ class LLMManager:
 		result =  "".join(corrected_words)	 # Join without adding extra spaces
 
 		return result
+
+	def calculate_reading_delay(self, text):
+		"""
+		Calculate a reading delay based on number of words with a min and max for RPG messages.
+		"""
+		words = text.split()
+		word_delay = len(words) * 0.5  # 0.3 seconds per word
+
+		return (min(max(2.5, word_delay), 5.0))
 
 	def tokenize_blocked_chars(self, blocked_chars):
 		logit_bias = {}

@@ -28,7 +28,7 @@ class ContextManager:
 		self.typing_hesitation_multiplier	= float(config.get('Context Manager', 'TypingHesitationMultiplier', fallback='2.0'))
 		self.typing_space_multiplier		= float(config.get('Context Manager', 'TypingSpaceMultiplier', fallback='0.5'))
 		self.thinking_min_delay				= float(config.get('Context Manager', 'ThinkingMinDelay', fallback='2.0'))
-		self.thinking_max_delay				= float(config.get('Context Manager', 'ThinkingMaxDelay', fallback='3.0'))
+		self.thinking_max_delay				= float(config.get('Context Manager', 'ThinkingMaxDelay', fallback='4.0'))
 
 		self.contexts = {}			# Maps llm_channel -> SortedDict(timestamp -> message)
 		self.channel_members = {}	# Maps llm_channel -> set(names)
@@ -79,8 +79,8 @@ class ContextManager:
 				line = re.sub(r"\[DELAY:\d+\]", "", line).strip()
 				timestamp = now + response_delay + this_delay
 
-				# 🔎 Check for near-duplicates within ±1 second
-				nearby_start = timestamp - 10
+				# Check for near-duplicates within ±3 seconds
+				nearby_start = timestamp - 3
 				nearby_end = timestamp + 3
 
 				is_duplicate = any(

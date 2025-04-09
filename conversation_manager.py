@@ -18,8 +18,8 @@ class ConversationManager:
 		self.output_max_pause_time		= int(config.get('Conversation Manager', 'OutputMaxPauseTime', fallback='5'))
 		self.fatigue_multiplier			= float(config.get('Conversation Manager', 'FatigueMultiplier', fallback='2.0'))
 		self.fatigue_reset_time			= int(config.get('Conversation Manager', 'FatigueResetTime', fallback='30'))
-		self.max_batch_size				= int(config.get('Conversation Manager', 'MaxBatchSize', fallback='6'))
-		self.rpg_pair_timeout			= int(config.get('Conversation Manager', 'RpgPairTimeout', fallback='3'))
+		self.max_batch_size				= int(config.get('Conversation Manager', 'MaxBatchSize', fallback='4'))
+		self.rpg_pairing_timeout		= float(config.get('Conversation Manager', 'RpgPairingTimeout', fallback='2.0'))
 
 		self.conversation_queues = defaultdict(deque)			# Incoming requests per llm_channel
 		self.conversation_locks = defaultdict(threading.Lock)	# Per-channel locks
@@ -43,12 +43,12 @@ class ConversationManager:
 		self.completed_request_count = {}
 
 		self.channel_thresholds = {
-			"RPG":				int(config.get("Conversation Manager", "rpg_request_threshold", fallback=2)),
-			"World":			int(config.get("Conversation Manager", "world_request_threshold", fallback=3)),
-			"Trade":			int(config.get("Conversation Manager", "default_request_threshold", fallback=4)),
-			"LocalDefense":		int(config.get("Conversation Manager", "default_request_threshold", fallback=4)),
-			"General":			int(config.get("Conversation Manager", "default_request_threshold", fallback=4)),
-			"LookingForGroup":	int(config.get("Conversation Manager", "default_request_threshold", fallback=4))
+			"RPG":				int(config.get("Conversation Manager", "rpg_request_threshold", fallback=5)),
+			"World":			int(config.get("Conversation Manager", "world_request_threshold", fallback=5)),
+			"Trade":			int(config.get("Conversation Manager", "default_request_threshold", fallback=5)),
+			"LocalDefense":		int(config.get("Conversation Manager", "default_request_threshold", fallback=5)),
+			"General":			int(config.get("Conversation Manager", "default_request_threshold", fallback=5)),
+			"LookingForGroup":	int(config.get("Conversation Manager", "default_request_threshold", fallback=5))
 		}
 
 		self.cancel_request_data = {
@@ -157,7 +157,7 @@ class ConversationManager:
 
 			self.last_batch_added[llm_channel] = (sender_name, message)
 
-	def fetch_pending_requests(self, llm_channel):
+	def fetch_pending_requests(self, llm_channel, current_size=0):
 		"""Fetches pending "new" and "reply" requests, ensuring they are processed one at a time."""
 		with self.queues_lock:
 			queue = self.conversation_queues[llm_channel]
@@ -199,7 +199,7 @@ class ConversationManager:
 					current_message_type == batch_message_type):
 					pending_requests.append(request)
 					batch_size += 1
-					if batch_size >= self.max_batch_size:
+					if batch_size + current_size >= self.max_batch_size:
 						break
 				else:
 					# Different sender or message type, stop collecting
@@ -250,7 +250,7 @@ class ConversationManager:
 			# If we only found one, check if it's too old
 			if len(pending_requests) == 1:
 				age = now - batch_timestamp
-				if age < self.rpg_pair_timeout * 1000:
+				if age < self.rpg_pairing_timeout * 1000:
 					return [], None	 # Still within grace period
 
 				# Timeout reached — cancel it

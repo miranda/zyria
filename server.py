@@ -13,6 +13,7 @@ import time
 from log_utils import debug_print, logger, logger_reconfigure
 import uuid
 import sys
+import json
 
 config = configparser.ConfigParser()
 config.read(['zyria.conf', 'prompts.conf'])
@@ -88,7 +89,12 @@ def generate_request():
 		"rpg": "__rpg_chat__"
 	}
 	message = request_data.get("message", default_messages.get(message_type, "__none__"))
-	request_data["message"] = message
+	try:
+		unescaped_message = json.loads(f'"{message}"')	# wraps the message in quotes and decodes it
+	except json.JSONDecodeError:
+		unescaped_message = message	 # fallback if somehow malformed
+
+	request_data["message"] = unescaped_message.strip()
 
 	# ✅ Get RPG sender/speaker if applicable
 	if message_type == "rpg":
@@ -105,21 +111,14 @@ def generate_request():
 	sender_name = speaker_sender_request_data["sender_name"]
 	speaker_name = speaker_sender_request_data["speaker_name"]
 	speaker_afk = speaker_sender_request_data["speaker_afk"]
-		
+
 	if sender_type == "player":
 		conversation_manager.prioritize_player_message(llm_channel)
 		conversation_manager.unsuspend_queue(llm_channel)
 		debug_print(f"Allowed request from player <{sender_name}> and released channel {llm_channel} from suspension", color="cyan")
 
 	else:
-		speaker_busy = True if conversation_manager.is_bot_busy(speaker_name) else False
-		sender_busy = True if conversation_manager.is_bot_busy(sender_name) else False
-		if message_type == "rpg" and (speaker_busy or sender_busy):
-			remaining_speaker_busy_time = conversation_manager.get_bot_remaining_busy_time(speaker_name)
-			remaining_sender_busy_time = conversation_manager.get_bot_remaining_busy_time(sender_name)
-			debug_print(f"Rejected RPG request <{speaker_name}> busy time remaining = {remaining_speaker_busy_time}, <{sender_name}> busy time remaining = {remaining_sender_busy_time})", color="red")
-			return jsonify({"error": "RPG participant is busy"}), 400
-		elif speaker_busy:
+		if conversation_manager.is_bot_busy(speaker_name):
 			# Reject request if bot is busy (ignoring new messages)
 			remaining_busy_time = conversation_manager.get_bot_remaining_busy_time(speaker_name)
 			debug_print(f"Rejected request for <{speaker_name}> (entity is busy, time remaining = {remaining_busy_time})", color="red")
@@ -164,7 +163,7 @@ def generate_request():
 			if completed_request:
 				response_delay = completed_request.get("response_delay", 0)
 				if response_delay > 0:
-					debug_print(f"Delaying response for {response_delay:.2f} seconds", color="yellow")
+					debug_print(f"Delaying response from <{speaker_name}> for {response_delay:.2f} seconds", color="yellow")
 					time.sleep(response_delay)
 
 				response = completed_request.get("mangos_response", {})
@@ -208,7 +207,7 @@ def get_rpg_speaker_sender(data):
 			"sender_name": data.get("bot", {}).get("name", "Unknown"),
 			"speaker_type": "npc",
 			"speaker_name": data.get("npc", {}).get("name", "Unknown"),
-			"speaker_afk": False,
+			"speaker_afk": False
 		}
 	else:
 		return {
@@ -216,7 +215,7 @@ def get_rpg_speaker_sender(data):
 			"sender_name": data.get("npc", {}).get("name", "Unknown"),
 			"speaker_type": "bot",
 			"speaker_name": data.get("bot", {}).get("name", "Unknown"),
-			"speaker_afk": data.get("bot", {}).get("afk", False),
+			"speaker_afk": data.get("bot", {}).get("afk", False)
 		}
 
 if __name__ == "__main__":

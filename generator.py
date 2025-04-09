@@ -85,19 +85,26 @@ class Generator:
 				self.batch_generate(requests)
 				continue
 
-			# Only stall this channel while waiting for more
-			wait_time = max(self.batch_cycle_time - len(requests), 1.0)
-			time.sleep(wait_time)
+			# Don't attempt to fetch more if already at batch size
+			if len(requests) >= self.conversation_manager.max_batch_size:
+				self.batch_generate(requests)
+				time.sleep(0.1)
+				continue
 
-			more_requests, more_message_type = self.conversation_manager.fetch_pending_requests(
-				llm_channel
-			)
+			# Otherwise wait for more
+			wait_time = self.batch_cycle_time * (1 - (len(requests) / self.conversation_manager.max_batch_size))
+			wait_time = max(wait_time, 0)
+			if wait_time > 0:
+				time.sleep(wait_time)
 
-			if more_requests:
-				with self.conversation_manager.queues_lock:
-					for request in more_requests:
-						request["status"] = "processing"
-					requests.extend(more_requests)
+				more_requests, more_message_type = self.conversation_manager.fetch_pending_requests(
+					llm_channel, current_size=len(requests)
+				)
+				if more_requests:
+					with self.conversation_manager.queues_lock:
+						for request in more_requests:
+							request["status"] = "processing"
+						requests.extend(more_requests)
 
 			self.batch_generate(requests)
 			time.sleep(0.1)
@@ -123,7 +130,8 @@ class Generator:
 				except Exception as e:
 					logger.exception(f"🔥 Exception while processing RPG channel '{llm_channel}': {e}")
 
-			time.sleep(1.5)	 # Poll RPG channels every 1.5 seconds
+				time.sleep(0.1)
+			time.sleep(5.0)	 # Poll RPG channels every 5 seconds
 
 	def extract_details(self, entity_data, entity_type="player"):
 		""" Extracts common entity attributes, adding extra fields for players and NPCs. """
