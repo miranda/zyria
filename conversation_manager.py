@@ -43,12 +43,12 @@ class ConversationManager:
 		self.completed_request_count = {}
 
 		self.channel_thresholds = {
-			"RPG":				int(config.get("Conversation Manager", "rpg_request_threshold", fallback=5)),
-			"World":			int(config.get("Conversation Manager", "world_request_threshold", fallback=5)),
-			"Trade":			int(config.get("Conversation Manager", "default_request_threshold", fallback=5)),
-			"LocalDefense":		int(config.get("Conversation Manager", "default_request_threshold", fallback=5)),
-			"General":			int(config.get("Conversation Manager", "default_request_threshold", fallback=5)),
-			"LookingForGroup":	int(config.get("Conversation Manager", "default_request_threshold", fallback=5))
+			"RPG":				int(config.get("Conversation Manager", "RpgRequestThreshold", fallback=4)),
+			"World":			int(config.get("Conversation Manager", "WorldRequestThreshold", fallback=6)),
+			"Trade":			int(config.get("Conversation Manager", "DefaultRequestThreshold", fallback=5)),
+			"LocalDefense":		int(config.get("Conversation Manager", "DefaultRequestThreshold", fallback=5)),
+			"General":			int(config.get("Conversation Manager", "DefaultRequestThreshold", fallback=5)),
+			"LookingForGroup":	int(config.get("Conversation Manager", "DefaultRequestThreshold", fallback=5))
 		}
 
 		self.cancel_request_data = {
@@ -334,8 +334,6 @@ class ConversationManager:
 					last_word = response_delay + self.extract_message_delays(response_text)
 					fatigue_counter.setdefault(speaker_name, 0)
 
-					last_spoke = self.last_speaker_data[llm_channel].get(speaker_name, now)
-					time_since_last_spoke = now - last_spoke
 					speaker_fatigue = fatigue_counter[speaker_name]
 					effective_fatigue = speaker_fatigue * self.fatigue_multiplier
 
@@ -345,7 +343,20 @@ class ConversationManager:
 						debug_print(f"Updating busy expire time for <{speaker_name}> (fatigue: {effective_fatigue:.2f} seconds)", color="dark_magenta")
 						self.set_bot_busy(speaker_name, delay=expire_time)
 
-					# ✅ Dispatch
+					# Insert pause for typing if a speaker's message overlaps too soon with their last message
+					if response_delay == 0 and not request.get("pause_triggered"):
+						speaker_finish_time = self.last_speaker_data[llm_channel].get(speaker_name, 0)
+						remaining = max(speaker_finish_time - now, 0)
+
+						if remaining > 0 and not self.is_paused(llm_channel):
+							if self.pause_for_typing(request, llm_channel, remaining):
+								request["pause_triggered"] = True
+								return None
+
+					last_spoke = self.last_speaker_data[llm_channel].get(speaker_name, now)
+					time_since_last_spoke = now - last_spoke
+
+					# Dispatch
 					logger.info(f"✅ Found completed request {request_id} in {llm_channel} for <{speaker_name}>")
 
 					if response_text:

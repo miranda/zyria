@@ -111,6 +111,7 @@ def generate_request():
 	sender_name = speaker_sender_request_data["sender_name"]
 	speaker_name = speaker_sender_request_data["speaker_name"]
 	speaker_afk = speaker_sender_request_data["speaker_afk"]
+	channel_members = request_data.get("channel_members", {})
 
 	if sender_type == "player":
 		conversation_manager.prioritize_player_message(llm_channel)
@@ -126,6 +127,9 @@ def generate_request():
 		elif speaker_afk:
 			debug_print(f"Rejected request for <{speaker_name}> (bot is AFK)", color="red")
 			return jsonify({"error": f"Bot <{speaker_name}> is AFK"}), 400
+		elif channel_members and speaker_name not in channel_members:
+			debug_print(f"Rejected request for <{speaker_name}> (not in channel members)", color="red")
+			return jsonify({"error": f"Entity <{speaker_name}> not a channel member"}), 400
 		else:
 			if conversation_manager.is_suspended(llm_channel):
 				if message_type == "new":
