@@ -406,49 +406,82 @@ class LLMManager:
 		return True
 
 	def remove_echoes(self, raw_output, context_lines):
-		"""
-		Removes echoed prefixes from raw_output lines if they start with a dialog from context.
-		"""
+		"""Removes echoed dialog from raw_output lines if they match or start with dialog from context."""
 		# Automatically split context_lines if given as a string
 		if isinstance(context_lines, str):
 			context_lines = context_lines.strip().split("\n")
-
-		def extract_dialog(line):
-			parts = line.split(":", 1)
-			return parts[1].strip() if len(parts) == 2 else ""
-
-		context_dialogs = set(extract_dialog(line) for line in context_lines if ":" in line)
-
+		
+		# Parse context into a mapping of speakers to their dialogs
+		context_dialogs = {}
+		context_dialog_set = set()	# Set of all dialogs regardless of speaker
+		
+		for line in context_lines:
+			if ":" in line:
+				parts = line.split(":", 1)
+				speaker = parts[0].strip()
+				dialog = parts[1].strip()
+				
+				if speaker not in context_dialogs:
+					context_dialogs[speaker] = []
+				context_dialogs[speaker].append(dialog)
+				context_dialog_set.add(dialog)
+		
+		# Process the output lines
 		output_lines = raw_output.strip().split('\n')
 		filtered_output = []
 		removed_echoes = []
-
+		
 		for line in output_lines:
 			if ":" not in line:
 				filtered_output.append(line)
 				continue
-
-			speaker, dialog = line.split(":", 1)
-			dialog = dialog.strip()
-
-			# Remove prefix if matching any context line
-			removed = False
-			for ctx_dialog in context_dialogs:
-				if dialog.startswith(ctx_dialog):
+			
+			parts = line.split(":", 1)
+			speaker = parts[0].strip()
+			dialog = parts[1].strip()
+			
+			should_keep = True
+			
+			# Check if this is a full dialog line in context
+			for ctx_dialog in context_dialog_set:
+				if dialog == ctx_dialog or (ctx_dialog.startswith(dialog) and len(dialog) > 5):
+					# Either exact match or dialog is a prefix of a context dialog (and not too short)
 					removed_echoes.append(line)
-					dialog = dialog[len(ctx_dialog):].lstrip()
-					removed = True
+					should_keep = False
 					break
-
-			# Only keep non-empty dialog
-			if dialog:
-				filtered_output.append(f"{speaker}: {dialog}")
-
+			
+			if not should_keep:
+				continue
+			
+			# Check speaker-specific dialog prefixes
+			if speaker in context_dialogs:
+				speaker_dialogs = context_dialogs[speaker]
+				
+				# Sort dialogs by length (descending) to match longest prefix first
+				speaker_dialogs.sort(key=len, reverse=True)
+				
+				for ctx_dialog in speaker_dialogs:
+					if dialog.startswith(ctx_dialog):
+						removed_echoes.append(line)
+						# Remove the prefix and any leading punctuation or whitespace
+						remainder = dialog[len(ctx_dialog):].lstrip()
+						remainder = remainder.lstrip('.,;:!?"\t ')
+						
+						if remainder:
+							filtered_output.append(f"{speaker}: {remainder}")
+						
+						should_keep = False
+						break
+			
+			if should_keep:
+				filtered_output.append(line)
+		
+		# Debug output
 		if removed_echoes:
-			debug_print("Removed echoes:", color="red")
+			print("Removed echoes from dialogues:")
 			for echo in removed_echoes:
-				debug_print(f" - {echo}", color="red")
-
+				print(f" - {echo}")
+		
 		return '\n'.join(filtered_output)
 
 	def parse_batch_text(self, raw_output, prompt_data, request_speaker_map):
@@ -477,7 +510,7 @@ class LLMManager:
 		speaker_names = prompt_data.get("speaker_names", [])
 		member_names = prompt_data.get("member_names", [])
 		llm_channel = prompt_data.get("llm_channel", [])
-		new_messages_text = prompt_data.get("new_messages", "")
+		prompt_context = prompt_data.get("context", "")
 
 		# Create regex for name markers
 		valid_speaker_pattern = "|".join(map(re.escape, sorted(set(speaker_names), key=len, reverse=True)))
@@ -502,7 +535,7 @@ class LLMManager:
 				# Ambiguous case: multiple speakers but no valid marker, store result for checking after removing echoes
 				failed_start = True
 
-		raw_output = self.remove_echoes(raw_output, new_messages_text)
+		raw_output = self.remove_echoes(raw_output, prompt_context)
 
 		if failed_start:
 			first_line = raw_output.strip().split("\n")[0]

@@ -199,7 +199,7 @@ class PromptBuilder:
 		if single_speaker:
 			debug_print("\n", quiet=True)
 
-		return prompt
+		return prompt, context
 
 	def build_rpg_prompt(self, *,
 		llm_channel,
@@ -283,7 +283,7 @@ class PromptBuilder:
 			debug_print(segment, color=color, quiet=True, end="")
 		debug_print("", quiet=True)
 
-		return prompt
+		return prompt, context
 
 	def get_player_messages_info(self, new_messages, speaker_names):
 		player_sender_names = set()

@@ -313,7 +313,7 @@ class Generator:
 		new_messages_text = "\n".join([f"{sender}: {msg}" for _, sender, msg, _ in new_messages])
 
 		# Build the prompt with PromptBuilder
-		prompt = self.prompt_builder.build_prompt(
+		prompt, prompt_context = self.prompt_builder.build_prompt(
 			llm_channel=llm_channel,
 			message_type=message_type,
 			senders=senders,
@@ -332,7 +332,7 @@ class Generator:
 				"speaker_names": speaker_names,
 				"member_names": member_names,
 				"llm_channel": llm_channel,
-				"new_messages": new_messages_text
+				"context": prompt_context
 			},
 			"priority": 1,
 			"request_speaker_map": request_speaker_map
@@ -389,7 +389,7 @@ class Generator:
 			recent_context, _ = self.context_manager.get_context(llm_channel, lines=2, new_messages=[])
 
 		# Build the prompt with PromptBuilder
-		prompt = self.prompt_builder.build_rpg_prompt(
+		prompt, prompt_context = self.prompt_builder.build_rpg_prompt(
 			llm_channel=llm_channel,
 			bot_data=bot_data,
 			npc_data=npc_data,
@@ -408,7 +408,7 @@ class Generator:
 				"member_names": [bot_name, npc_name],
 				"llm_channel": llm_channel,
 				"chat_topic": chat_topic,
-				"new_messages": recent_context
+				"context": prompt_context
 			},
 			"request_speaker_map": request_speaker_map
 		}
