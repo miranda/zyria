@@ -22,14 +22,6 @@ class ContextManager:
 		self.max_messages_per_channel	= int(config.get('Context Manager', 'MaxMessagesPerChannel', fallback='50'))
 		self.prune_interval				= int(config.get('Context Manager', 'PruneInterval', fallback='300'))
 
-		self.typing_min_speed				= int(config.get('Context Manager', 'TypingMinSpeed', fallback='50'))
-		self.typing_max_speed				= int(config.get('Context Manager', 'TypingMaxSpeed', fallback='150'))
-		self.typing_hesitation_chance		= float(config.get('Context Manager', 'TypingHesitationSpeed', fallback='0.05'))
-		self.typing_hesitation_multiplier	= float(config.get('Context Manager', 'TypingHesitationMultiplier', fallback='2.0'))
-		self.typing_space_multiplier		= float(config.get('Context Manager', 'TypingSpaceMultiplier', fallback='0.5'))
-		self.thinking_min_delay				= float(config.get('Context Manager', 'ThinkingMinDelay', fallback='2.0'))
-		self.thinking_max_delay				= float(config.get('Context Manager', 'ThinkingMaxDelay', fallback='4.0'))
-
 		self.contexts = {}			# Maps llm_channel -> SortedDict(timestamp -> message)
 		self.channel_members = {}	# Maps llm_channel -> set(names)
 		self.context_lock = threading.Lock()

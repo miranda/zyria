@@ -21,6 +21,14 @@ class ConversationManager:
 		self.max_batch_size				= int(config.get('Conversation Manager', 'MaxBatchSize', fallback='4'))
 		self.rpg_pairing_timeout		= float(config.get('Conversation Manager', 'RpgPairingTimeout', fallback='2.0'))
 
+		self.typing_min_speed				= int(config.get('Context Manager', 'TypingMinSpeed', fallback='50'))
+		self.typing_max_speed				= int(config.get('Context Manager', 'TypingMaxSpeed', fallback='150'))
+		self.typing_hesitation_chance		= float(config.get('Context Manager', 'TypingHesitationSpeed', fallback='0.05'))
+		self.typing_hesitation_multiplier	= float(config.get('Context Manager', 'TypingHesitationMultiplier', fallback='2.0'))
+		self.typing_space_multiplier		= float(config.get('Context Manager', 'TypingSpaceMultiplier', fallback='0.5'))
+		self.thinking_min_delay				= float(config.get('Context Manager', 'ThinkingMinDelay', fallback='2.0'))
+		self.thinking_max_delay				= float(config.get('Context Manager', 'ThinkingMaxDelay', fallback='4.0'))
+
 		self.conversation_queues = defaultdict(deque)			# Incoming requests per llm_channel
 		self.conversation_locks = defaultdict(threading.Lock)	# Per-channel locks
 		self.queues_lock = threading.RLock()					# Lock for modifying global queues
@@ -102,6 +110,29 @@ class ConversationManager:
 		"""Returns a list of channels that have pending requests."""
 		with self.queues_lock:
 			return [channel for channel, queue in self.conversation_queues.items() if queue]
+
+	def get_first_speaker_time_received(self, speaker_name, request_speaker_map, llm_channel):
+		"""Returns the time_received of the request matching the given speaker name."""
+		with self.queues_lock:
+			if not llm_channel or llm_channel not in self.conversation_queues:
+				logger.error(f"❌ Invalid channel: {llm_channel}")
+				return None
+
+			queue = self.conversation_queues[llm_channel]
+
+			# Find the request_id that matches the speaker
+			for request_id, speaker in request_speaker_map.items():
+				if speaker == speaker_name:
+					# Now look for that request in the queue
+					for request in queue:
+						if request.get("request_id") == request_id:
+							return request.get("time_received")
+
+					logger.error(f"❌ Request ID {request_id} not found in queue for speaker {speaker_name}")
+					return None
+
+			logger.error(f"❌ No request ID found for speaker {speaker_name}")
+			return None
 
 	def is_channel_overloaded(self, llm_channel):
 		"""Checks if the given channel is overloaded based on configured thresholds."""
@@ -517,7 +548,7 @@ class ConversationManager:
 
 	def cancel_request(self, request, release=False):
 		"""Handles responses from LLM and updates the corresponding requests in the queue."""
-		with self.queues_lock:	# 🔒 Ensure thread safety
+		with self.queues_lock:	# Ensure thread safety
 			# Update it in place
 			request.update({
 				"status": "cancelled",
@@ -594,3 +625,19 @@ class ConversationManager:
 			else:
 				self.busy_bots.pop(bot_name, None)	# Remove busy state
 				debug_print(f"Released <{bot_name}> from busy state", color="green")
+
+	def calculate_typing_delay(self, text, thinking=False):
+		"""
+		Calculate a humanized typing delay based on text length, random typing speed, and character-level variations.
+		"""
+		total_delay = random.uniform(self.thinking_min_delay, self.thinking_max_delay) if thinking else 0.0
+
+		for char in text:
+			base_delay = random.uniform(self.typing_min_speed, self.typing_max_speed) / 1000.0
+			if char == ' ':
+				base_delay *= self.typing_space_multiplier
+			elif random.random() < self.typing_hesitation_chance:
+				base_delay *= self.typing_hesitation_multiplier
+			total_delay += base_delay
+
+		return total_delay 

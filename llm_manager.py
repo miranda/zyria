@@ -15,10 +15,9 @@ import itertools
 import time
 
 class LLMManager:
-	def __init__(self, config, *, context_manager, response_callback):
+	def __init__(self, config, conversation_manager):
 		self.config = config
-		self.context_manager = context_manager
-		self.response_callback = response_callback	# Store callback function
+		self.conversation_manager = conversation_manager
 
 		self.blocked_tokens				= config.get('LLM Manager', 'BlockedTokens', fallback='')
 		self.base_tokens_per_speaker	= int(config.get('LLM Manager', 'BaseTokensPerSpeaker', fallback='30'))
@@ -30,8 +29,6 @@ class LLMManager:
 		self.main_queue_size			= int(config.get('LLM Manager', 'MainQueueSize', fallback='100'))
 		self.rpg_queue_size				= int(config.get('LLM Manager', 'RpgQueueSize', fallback='20'))
 		self.rpg_message_delay			= 3.5
-
-		self.rpg_text_cache = {}	# Text cache for RPG conversations to reduce LLM calls
 
 		self.model = Llama(
 			model_path=config.get('LLM Manager', 'ModelPath'),
@@ -86,6 +83,7 @@ class LLMManager:
 		priority = request_payload["priority"]
 		prompt_data = request_payload["prompt_data"]
 		request_speaker_map = request_payload["request_speaker_map"]
+		llm_channel = prompt_data.get("llm_channel", None)
 
 		logger.info(f"Queueing request batch {request_speaker_map} - Priority {priority}")
 
@@ -111,7 +109,9 @@ class LLMManager:
 							logger.debug(f"Purging request (priority {item[0]})")
 
 							# ✅ Call callback with 'purged' result
-							self.cancel_response(purged_request_map, finish_reason="purged")
+							self.conversation_manager.receive_llm_responses(
+								self.cancel_responses(purged_request_map, purged_prompt_data["llm_channel"], finish_reason="purged")
+							)
 
 						except ValueError:
 							pass  # Item was already removed
@@ -122,7 +122,9 @@ class LLMManager:
 				else:
 					# New request is lower priority → Drop it
 					logger.debug(f"Dropping request (priority {priority}) because queue is full")
-					self.cancel_response(request_speaker_map, finish_reason="dropped")
+					self.conversation_manager.receive_llm_response(
+						self.cancel_responses(request_speaker_map, llm_channel, finish_reason="dropped")
+					)
 					return	# ✅ Do not add this request
 
 			# ✅ Add new request to queue
@@ -132,10 +134,13 @@ class LLMManager:
 		"""Queues an RPG request, handles full queue with proper cancellation."""
 		prompt_data = request_payload["prompt_data"]
 		request_speaker_map = request_payload["request_speaker_map"]
+		llm_channel = prompt_data.get("llm_channel", None)
 
 		if self.rpg_queue.full():
 			logger.debug("RPG queue full, cancelling request cleanly.")
-			self.cancel_response(request_speaker_map, finish_reason="rpg_queue_full")
+			self.conversation_manager.receive_llm_response(
+				self.cancel_responses(request_speaker_map, llm_channel, finish_reason="rpg_queue_full")
+			)
 			return
 
 		logger.info(f"Queueing RPG request batch {request_speaker_map}")
@@ -156,13 +161,14 @@ class LLMManager:
 				start_time = time.time()
 				self.last_main_process_time = start_time
 				with self.llm_lock:
+					# Call LLM
 					response_dict = self.call_llm(prompt_data, request_speaker_map)
 				elapsed = time.time() - start_time
 
 				debug_print(f"LLM inference completed in {elapsed:.2f} seconds.", color="dark_green")
 
-				# Send back responses to server via callback
-				self.response_callback(response_dict)
+				# Send back responses to server via conversation manager
+				self.conversation_manager.receive_llm_response(response_dict)
 
 				# Mark task as completed
 				self.queue.task_done()
@@ -189,10 +195,13 @@ class LLMManager:
 				request_payload = self.rpg_queue.get()
 				request_speaker_map = request_payload["request_speaker_map"]
 				time_received = request_payload.get("time_received", time.time())
+				llm_channel = request_payload.get("llm_channel", None)
 
 				if time.time() - time_received > self.max_rpg_request_age:
 					logger.debug("RPG request too old, cancelling cleanly.")
-					self.cancel_response(request_speaker_map, finish_reason="rpg_request_stale")
+					self.conversation_manager.receive_llm_response(
+						self.cancel_responses(request_speaker_map, llm_channel, finish_reason="rpg_request_stale")
+					)
 					self.rpg_queue.task_done()
 					continue
 
@@ -202,35 +211,35 @@ class LLMManager:
 
 				start_time = time.time()
 				with self.llm_lock:
+					# Call LLM
 					response_dict = self.call_llm(prompt_data, request_speaker_map)
 				elapsed = time.time() - start_time
 
 				debug_print(f"RPG LLM inference completed in {elapsed:.2f} seconds.", color="dark_green")
 
-				self.response_callback(response_dict)
+				self.conversation_manager.receive_llm_response(response_dict)
 				self.rpg_queue.task_done()
 
 			except Exception as e:
 				logger.error(f"Error processing RPG queue - {e}")
 				logger.error(traceback.format_exc())
 
-	def cancel_response(self, request_speaker_map, finish_reason="stop"):
-		"""
-		Cancels a response and returns an empty response dictionary.
-		This is used when a request is dropped or purged.
-		"""
+	def cancel_responses(self, request_speaker_map, llm_channel, finish_reason="stop"):
+		response_dict = {
+			request_id: {
+				"mangos_response": {
+					"text": "",
+					"finish_reason": finish_reason,
+					"prompt_tokens": 0,
+					"completion_tokens": 0,
+				},
+				"speaker_name": speaker_name,
+				"llm_channel": llm_channel,
+				"response_delay": 0
+			} for request_id, speaker_name in request_speaker_map.items()
+		}
 
-		response_dict = {}
-
-		for request_id in request_speaker_map:
-			response_dict[request_id] = {
-				"text": "",
-				"finish_reason": finish_reason,
-				"prompt_tokens": 0,
-				"completion_tokens": 0,
-			}
-
-		return response_dict  # Return correctly structured response dictionary
+		return response_dict
 
 	def estimate_tokens(self, num_speakers): 
 		"""
@@ -286,8 +295,10 @@ class LLMManager:
 
 			# Process batch response for multiple speakers
 			dialogues, speaker_order = self.parse_batch_text(raw_output, prompt_data, request_speaker_map)
-			final_responses = self.apply_delays_to_dialogues(dialogues, speaker_order, request_speaker_map, message_type)
-			
+			if not dialogues or not speaker_order:
+				return self.cancel_responses(request_speaker_map, llm_channel, finish_reason="empty_response")
+
+			final_responses = self.apply_delays_to_dialogues(dialogues, speaker_order, request_speaker_map, message_type, llm_channel)
 			response_dict = {}
 
 			for request_id, response_data in final_responses.items():  # Unpack request_id and data
@@ -317,19 +328,7 @@ class LLMManager:
 
 		except Exception as e:
 			logger.error(f"Error calling LLM - {e}")
-			return {
-				request_id: {
-					"mangos_response": {
-						"text": "",
-						"finish_reason": "error",
-						"prompt_tokens": 0,
-						"completion_tokens": 0,
-					},
-					"speaker_name": request_speaker_map.get(request_id, "Unknown"),
-					"llm_channel": llm_channel,
-					"response_delay": 0	# Default delays to 0 in case of an error
-				} for request_id in request_speaker_map.keys()
-			}  # ✅ Return structured empty responses for all
+			return self.cancel_responses(request_speaker_map, llm_channel, finish_reason="error") 
 
 	def clean_raw_output(self, raw_output):
 		# Remove any hidden characters
@@ -535,7 +534,10 @@ class LLMManager:
 				# Ambiguous case: multiple speakers but no valid marker, store result for checking after removing echoes
 				failed_start = True
 
-		raw_output = self.remove_echoes(raw_output, prompt_context)
+		raw_output = self.remove_echoes(raw_output, prompt_context).strip()
+		if not raw_output:
+			debug_print("LLM Mansger: Nothing valid left in raw output to parse. Aborting.", color="red")
+			return [], []	# Return empty responses if no text
 
 		if failed_start:
 			first_line = raw_output.strip().split("\n")[0]
@@ -602,10 +604,13 @@ class LLMManager:
 
 		return dialogues, speaker_order
 
-	def apply_delays_to_dialogues(self, dialogues, speaker_order, request_speaker_map, message_type):
+	def apply_delays_to_dialogues(self, dialogues, speaker_order, request_speaker_map, message_type, llm_channel):
 		"""Applies response delays and embedded delay tags to dialogues, supporting RPG and non-RPG types."""
 		speaker_names = list(request_speaker_map.values())
 		response_delays = {}
+
+		# Get the time received of the request for the first speaker's dialogue
+		first_speaker_time_received = self.conversation_manager.get_first_speaker_time_received(speaker_order[0], request_speaker_map, llm_channel)
 
 		# 1. Build a global schedule: each entry represents one dialogue segment.
 		global_schedule = []  # Each entry: {"speaker": speaker, "line": segment}
@@ -641,16 +646,21 @@ class LLMManager:
 		else:
 			# Non-RPG style: first line gets full typing delay; gaps are based on typing delay or fixed rpg delay
 			first_line_typing_delay = (
-				self.context_manager.calculate_typing_delay(global_schedule[0]["line"], thinking=True)
+				self.conversation_manager.calculate_typing_delay(global_schedule[0]["line"], thinking=True)
 				if global_schedule else 0.0
 			)
-			global_time = first_line_typing_delay
+			debug_print(f"Calculated {first_line_typing_delay:.2f} seconds typing delay for first speaker <{speaker_order[0]}>", color="grey")
+			lag = time.time() - (first_speaker_time_received / 1000.0)
+			debug_print(f"Lag = {lag}", color="grey")
+			first_line_typing_delay = max(first_line_typing_delay - lag, 0)
+			debug_print(f"Adjusting delay of first line to {first_line_typing_delay:.2f} seconds", color="dark_yellow")
 
+			global_time = first_line_typing_delay
 			for i, entry in enumerate(global_schedule):
 				if i == 0:
 					entry["global_time"] = first_line_typing_delay
 				else:
-					gap = self.context_manager.calculate_typing_delay(entry["line"], thinking=True)
+					gap = self.conversation_manager.calculate_typing_delay(entry["line"], thinking=True)
 					entry["global_time"] = global_schedule[i - 1]["global_time"] + gap
 
 		# 3. Collect segment times per speaker

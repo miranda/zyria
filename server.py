@@ -31,13 +31,9 @@ app = Flask(__name__)
 npc_manager = NPCManager(config)
 context_manager = ContextManager(config)
 conversation_manager = ConversationManager(config, context_manager) # Initialize ConversationManager, pass it ContextManager
+llm_manager = LLMManager(config, conversation_manager=conversation_manager) # Initialize LLMManager, pass it ConversationManager
 
-llm_manager = LLMManager(config,	# Initialize LLMManager, pass it ContextManager
-	context_manager=context_manager,
-	response_callback=conversation_manager.receive_llm_response
-)
 llm_manager.update_words()	# Check for english dictionary and download if missing
-
 memory_manager = MemoryManager(config, llm_manager) # Initialize MemoryManager, pass it LLMManager
 prompt_builder = PromptBuilder(config, memory_manager, context_manager, npc_manager) # Initialize PromptBuilder
 attention_manager = AttentionManager(config)

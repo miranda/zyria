@@ -6,29 +6,31 @@ import os
 # ====== Color tables ======
 
 COLORS = {
-	"none":			"\033[0m",
-	"dark_red":		"\033[31m",
-	"dark_green":	"\033[32m",
-	"dark_yellow":	"\033[33m",
-	"dark_blue":	"\033[34m",
-	"dark_magenta": "\033[35m",
-	"dark_cyan":	"\033[36m",
-	"grey":			"\033[37m",
-	"red":			"\033[91m",
-	"green":		"\033[92m",
-	"yellow":		"\033[93m",
-	"blue":			"\033[94m",
-	"magenta":		"\033[95m",
-	"cyan":			"\033[96m",
-	"white":		"\033[97m"
+	"none":				"\033[0m",
+	"dark_red":			"\033[31m",
+	"dark_green":		"\033[32m",
+	"dark_yellow":		"\033[33m",
+	"dark_blue":		"\033[34m",
+	"dark_magenta":		"\033[35m",
+	"dark_cyan":		"\033[36m",
+	"grey":				"\033[37m",
+	"red":				"\033[91m",
+	"green":			"\033[92m",
+	"yellow":			"\033[93m",
+	"blue":				"\033[94m",
+	"magenta":			"\033[95m",
+	"cyan":				"\033[96m",
+	"white":			"\033[97m",
+	"blue_background":	"\033[97;44m",
+	"red_background":	"\033[97;41m"
 }
 
 LEVEL_DEFAULT_COLORS = {
 	logging.DEBUG:	  "dark_magenta",
 	logging.INFO:	  "grey",
 	logging.WARNING:  "dark_yellow",
-	logging.ERROR:	  "\033[44m",	# White on blue
-	logging.CRITICAL: "\033[41m"	# White on red
+	logging.ERROR:	  "blue_background",
+	logging.CRITICAL: "red_background"
 }
 
 # ====== Logger Components ======
