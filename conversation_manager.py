@@ -38,16 +38,17 @@ class ConversationManager:
 		# Lag compensation for player messages per channel
 		self.last_adjusted_player_message = defaultdict(lambda: (None, 0.0))  # key → (last_key, lag_value)
 
-		self.busy_bots = {}				# Tracks the scheduled bot busy state release times
-		self.paused_queues = {}			# Tracks paused queues with timestamps
-		self.suspended_queues = {}		# Tracks suspended queues with timestamps
-		self.last_paused_data = {}		# Stores last time a queue was paused
-		self.last_paused_times = {}		# Stores last time a queue was paused
-		self.sleeping_queues = {}		# Tracks queues in sleep mode 
-		self.sleep_thresholds = {}		# Stores random sleep message thresholds
-		self.last_request_time = {}		# Stores the last request timestamp per channel
-		self.last_speak_time = {}		# Tracks last speaking time for each bot
-		self.last_batch_added = {}		# Tracks the sender and message of the last request added to queue
+		self.busy_lock = threading.Lock()	# Lock for modifying bot busy states
+		self.busy_bots = {}					# Tracks the scheduled bot busy state release times
+		self.paused_queues = {}				# Tracks paused queues with timestamps
+		self.suspended_queues = {}			# Tracks suspended queues with timestamps
+		self.last_paused_data = {}			# Stores last time a queue was paused
+		self.last_paused_times = {}			# Stores last time a queue was paused
+		self.sleeping_queues = {}			# Tracks queues in sleep mode 
+		self.sleep_thresholds = {}			# Stores random sleep message thresholds
+		self.last_request_time = {}			# Stores the last request timestamp per channel
+		self.last_speak_time = {}			# Tracks last speaking time for each bot
+		self.last_batch_added = {}			# Tracks the sender and message of the last request added to queue
 		self.completed_request_count = {}
 
 		self.channel_thresholds = {
@@ -580,41 +581,38 @@ class ConversationManager:
 
 	def is_bot_busy(self, bot_name):
 		"""Returns True if a bot is still busy, False otherwise. Cleans up expired bots."""
-		with self.queues_lock:
+		with self.busy_lock:
 			release_time = self.busy_bots.get(bot_name)
 
 			if release_time is None:
-				return False  # Bot is not busy
+				return False	# Not busy
 
 			if release_time == float('inf'):
-				return True	 # Permanently busy
+				return True		# Indefinitely busy
 
 			current_time = time.time()
 			if release_time - current_time <= 1.0:	# Treat <1 second as expired
-				del self.busy_bots[bot_name]  # Expired, remove from dict
+				del self.busy_bots[bot_name]		# Expired, remove from dict
 				return False
 
-			return True	 # Still busy
+			return True		# Still busy
 
 	def get_bot_remaining_busy_time(self, bot_name):
-		"""Returns the remaining busy time for a bot, 0 if expired, or None if not set."""
-		with self.queues_lock:
+		with self.busy_lock:
 			release_time = self.busy_bots.get(bot_name)
 
 			if release_time is None:
 				return None	 # No expiration set
 
 			if release_time == float('inf'):
-				return float('inf')	 # Permanently busy
+				return float('inf')	 # Indefinitely busy
 
-			remaining_time = max(0.0, release_time - time.time())
-
-			return remaining_time
+			return max(0.0, release_time - time.time())
 
 	def set_bot_busy(self, bot_name, delay=None):
 		"""Sets a bot as busy for a given delay. If delay is 0, it expires immediately.
 		If delay is None, the bot is set to indefinitely busy."""
-		with self.queues_lock:
+		with self.busy_lock:
 			if delay is None:
 				self.busy_bots[bot_name] = float('inf')	 # Set indefinitely busy
 				debug_print(f"Marked <{bot_name}> as indefinitely busy", color="magenta")

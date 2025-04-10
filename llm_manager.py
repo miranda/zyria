@@ -74,12 +74,10 @@ class LLMManager:
 	def queue_request(self, request_payload):
 		"""
 		Queues a request for the LLM.
-		
-		If the queue is full (100 items), it removes all requests with the worst (i.e. highest
-		numerical) priority from the queue (calling the callback for each with a 'purged' result).
-		If the new request itself is not better than what is already in the queue, it is dropped.
-		"""
 
+		If the queue is full, purges lowest-priority items to make room.
+		Will drop the incoming request if it has worse or equal priority and no room.
+		"""
 		priority = request_payload["priority"]
 		prompt_data = request_payload["prompt_data"]
 		request_speaker_map = request_payload["request_speaker_map"]
@@ -88,83 +86,96 @@ class LLMManager:
 		logger.info(f"Queueing request batch {request_speaker_map} - Priority {priority}")
 
 		with self.queue_lock:
-			# If the queue is full, purge lowest priority requests.
-			if self.queue.qsize() >= self.queue.maxsize:
-				# Get current items (thread-safe under lock)
-				current_items = list(self.queue.queue)
+			if self.queue.full():
+				# Safely extract all items (Python's queue.PriorityQueue is a wrapper around heapq)
+				all_items = []
+				while not self.queue.empty():
+					all_items.append(self.queue.get_nowait())
 
-				# Determine the worst priority in the queue
-				worst_priority = max(item[0] for item in current_items)
+				# Sort by priority (lowest number = higher priority)
+				all_items.append((priority, next(self.request_counter), prompt_data, request_speaker_map))
+				all_items.sort(key=lambda x: x[0])	# Smallest priority = most important
 
-				if priority < worst_priority:
-					# New request is of higher importance → Purge lowest-priority items
-					purge_candidates = [item for item in current_items if item[0] == worst_priority]
+				# Keep only the best N
+				kept = all_items[:self.main_queue_size]
+				dropped = all_items[self.main_queue_size:]
 
-					for item in purge_candidates:
-						try:
-							self.queue.queue.remove(item)
-							self.queue.task_done()	# ✅ Mark as processed
+				# Cancel all dropped
+				for dropped_item in dropped:
+					_, _, dropped_prompt_data, dropped_request_map = dropped_item
+					logger.debug(f"Purging request (priority {dropped_item[0]}) due to full queue")
+					self.conversation_manager.receive_llm_responses(
+						self.cancel_responses(dropped_request_map, dropped_prompt_data.get("llm_channel"), finish_reason="purged")
+					)
 
-							_, purged_prompt_data, purged_request_map = item  # ✅ Extract purged data
-							logger.debug(f"Purging request (priority {item[0]})")
+				# Re-add all kept items
+				for item in kept:
+					self.queue.put_nowait(item)
+				
+				debug_print(f"Queue now contains {self.queue.qsize()} items after purge", color="dark_cyan")
 
-							# ✅ Call callback with 'purged' result
-							self.conversation_manager.receive_llm_responses(
-								self.cancel_responses(purged_request_map, purged_prompt_data["llm_channel"], finish_reason="purged")
-							)
-
-						except ValueError:
-							pass  # Item was already removed
-
-					# Re-heapify after manual removals
-					heapq.heapify(self.queue.queue)
-
-				else:
-					# New request is lower priority → Drop it
-					logger.debug(f"Dropping request (priority {priority}) because queue is full")
-					self.conversation_manager.receive_llm_response(
+				# If our request wasn't in the final list, it was dropped
+				if (priority, prompt_data, request_speaker_map) not in kept:
+					logger.debug(f"Request batch dropped due to low priority {priority}")
+					self.conversation_manager.receive_llm_responses(
 						self.cancel_responses(request_speaker_map, llm_channel, finish_reason="dropped")
 					)
-					return	# ✅ Do not add this request
+					return
 
-			# ✅ Add new request to queue
-			self.queue.put((priority, next(self.request_counter), prompt_data, request_speaker_map))
+			else:
+				# Queue has room — add normally
+				self.queue.put((priority, next(self.request_counter), prompt_data, request_speaker_map))
 
 	def queue_rpg_request(self, request_payload):
-		"""Queues an RPG request, handles full queue with proper cancellation."""
+		"""Queues an RPG request, evicting the oldest if full."""
 		prompt_data = request_payload["prompt_data"]
 		request_speaker_map = request_payload["request_speaker_map"]
 		llm_channel = prompt_data.get("llm_channel", None)
 
 		if self.rpg_queue.full():
-			logger.debug("RPG queue full, cancelling request cleanly.")
-			self.conversation_manager.receive_llm_response(
-				self.cancel_responses(request_speaker_map, llm_channel, finish_reason="rpg_queue_full")
-			)
-			return
+			try:
+				# Drop oldest (FIFO) and cancel it
+				oldest = self.rpg_queue.get_nowait()
+				old_llm_channel = oldest.get("llm_channel", None)
+				old_request_speaker_map = oldest.get("request_speaker_map", {})
 
+				self.conversation_manager.receive_llm_responses(
+					self.cancel_responses(old_request_speaker_map, old_llm_channel, finish_reason="rpg_purged")
+				)
+
+				debug_print("RPG queue full — dropped oldest request to make room.", color="cyan")
+
+			except queue.Empty:
+				logger.warning("Attempted to purge RPG queue, but it was empty")
+
+		# Enqueue the new request
 		logger.info(f"Queueing RPG request batch {request_speaker_map}")
 		self.rpg_queue.put(request_payload)
 
 	def process_queue(self):
-		"""Processes the queue, sending requests to the LLM"""
+		"""Processes the main LLM queue using priority order."""
 		while True:
-			time.sleep(0.1)			
+			time.sleep(0.1)	 # Slight delay to avoid CPU hammering
 			try:
 				queue_size = self.queue.qsize()
 				if queue_size > 0:
 					debug_print(f"Queue length: {queue_size} pending requests.", color="yellow")
 
-				priority, batch_id, prompt_data, request_speaker_map = self.queue.get()
+				# Safely attempt to get an item with timeout
+				try:
+					priority, batch_id, prompt_data, request_speaker_map = self.queue.get(timeout=1.0)
+				except queue.Empty:
+					continue  # No request in queue, loop again
+
 				debug_print(f"Processing request batch {request_speaker_map} - Priority {priority}")
 
 				start_time = time.time()
 				self.last_main_process_time = start_time
-				with self.llm_lock:
-					# Call LLM
-					response_dict = self.call_llm(prompt_data, request_speaker_map)
-				elapsed = time.time() - start_time
 
+				with self.llm_lock:
+					response_dict = self.call_llm(prompt_data, request_speaker_map)
+
+				elapsed = time.time() - start_time
 				debug_print(f"LLM inference completed in {elapsed:.2f} seconds.", color="dark_green")
 
 				# Send back responses to server via conversation manager
@@ -175,24 +186,20 @@ class LLMManager:
 
 			except Exception as e:
 				logger.error(f"Error processing queue - {e}")
-				logger.error(traceback.format_exc())  # ✅ Print full stack trace
+				logger.error(traceback.format_exc())
 
 	def process_rpg_queue(self):
 		"""Processes the RPG queue in FIFO order, skips old requests based on time_received."""
 		while True:
-			queue_size_check = self.queue.qsize()
 			time.sleep(5.0)
 			time_since_main_process = time.time() - self.last_main_process_time
 			try:
 				# Skip RPG processing if the main queue is still busy
-				if (queue_size_check > 0 or self.queue.qsize() > 0 or time_since_main_process < 5.0):
+				if self.queue.qsize() > 0 or time_since_main_process < 5.0:
 					continue  # Main queue takes priority
 
-				if not self.rpg_queue.empty():
-					queue_size = self.rpg_queue.qsize()
-					debug_print(f"RPG queue length: {queue_size} pending requests.", color="yellow")
+				request_payload = self.rpg_queue.get(timeout=1.0)
 
-				request_payload = self.rpg_queue.get()
 				request_speaker_map = request_payload["request_speaker_map"]
 				time_received = request_payload.get("time_received", time.time())
 				llm_channel = request_payload.get("llm_channel", None)
@@ -206,12 +213,10 @@ class LLMManager:
 					continue
 
 				prompt_data = request_payload["prompt_data"]
-
 				debug_print(f"Processing RPG request batch {request_speaker_map}")
 
 				start_time = time.time()
 				with self.llm_lock:
-					# Call LLM
 					response_dict = self.call_llm(prompt_data, request_speaker_map)
 				elapsed = time.time() - start_time
 
@@ -219,6 +224,10 @@ class LLMManager:
 
 				self.conversation_manager.receive_llm_response(response_dict)
 				self.rpg_queue.task_done()
+
+			except queue.Empty:
+				# This happens if `get(timeout=1.0)` times out – just loop again
+				continue
 
 			except Exception as e:
 				logger.error(f"Error processing RPG queue - {e}")
