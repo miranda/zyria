@@ -236,14 +236,12 @@ class Generator:
 			speaker_update = speaker_data.copy()
 			speaker_name = speaker_update.pop("name")
 
-			# ✅ If the speaker already has a request, cancel the previous one
+			# ✅ If the speaker already has a request, cancel the new one
 			if message_type == "reply":
-				for prev_request_id, prev_speaker_name in list(request_speaker_map.items()):
-					if prev_speaker_name == speaker_name:
-						del request_speaker_map[request_id]
-						debug_print(f"Cancelling redundant request {request_id} for <{speaker_name}>", color="dark_cyan")
-						self.conversation_manager.cancel_by_id_channel(request_id, llm_channel)
-						break
+				if speaker_name in request_speaker_map.values():
+					debug_print(f"Skipping duplicate speaker request {request_id} for <{speaker_name}>", color="dark_cyan")
+					self.conversation_manager.cancel_by_id_channel(request_id, llm_channel, release=True)
+					continue
 
 			ignore_votes = []
 			for sender_data_entry in unique_senders.values():
