@@ -1,6 +1,7 @@
 import string
 from collections import defaultdict
 from log_utils import debug_print, logger
+from rapidfuzz import process, fuzz
 
 class SafeDict(dict):
 	def __missing__(self, key):
@@ -90,7 +91,11 @@ class PromptBuilder:
 
 		participants_info = [self.memory_manager.get_formatted_character_info(name, member_names, basic=True) for name in all_names]
 		participants_info_text = '\n'.join(participants_info)
-		
+		similar_names = self.get_similar_names(all_names)
+		if similar_names:
+			similar_names_text = " - " + "\n".join(self.format_list_to_english(name_list) for name_list in similar_names)
+			participants_info_text += "\n\n" + self.get_prompt("PromptSimilarNames").format(similar_names=similar_names_text)
+
 		sender_info = [
 			self.memory_manager.get_formatted_character_info(name, member_names, show_personality=True)
 			for name in sender_names if name not in speaker_names
@@ -183,7 +188,15 @@ class PromptBuilder:
 		post_prompt = "\n\n" + self.format_template(post_prompt_template, format_kwargs)
 
 		# Final assembly
-		prompt = pre_prompt + core_prompt + restrictions_prompt + context_prompt + post_prompt + player_messages_prompt + speaker_prompt
+		prompt = (
+			pre_prompt +
+			core_prompt +
+			restrictions_prompt +
+			context_prompt +
+			post_prompt +
+			player_messages_prompt +
+			speaker_prompt
+		)
 
 		debug_print("Assembled prompt preview:")
 		for segment, color in [
@@ -379,3 +392,40 @@ class PromptBuilder:
 		else:
 			conj = "or" if negative else "and"
 			return ", ".join(items[:-1]) + f", {conj} {items[-1]}"
+
+	def get_similar_names(self, known_names, threshold=50, min_length_ratio=0.8):
+		"""
+		Returns a list of lists containing names that are similar to each other.
+
+		- known_names: List of valid character names (e.g., ["Zyria", "Zyarel", "Bunkins", "Bonkins"]).
+		- threshold: Minimum similarity score (0-100) to consider names as similar.
+		- min_length_ratio: Minimum length ratio to avoid false positives (e.g., "Al" vs "Alice").
+		
+		Returns: List of lists, e.g., [["Zyria", "Zyarel", "Zyrana"], ["Bunkins", "Bonkins"]]
+		"""
+		groups = []
+		seen = set()
+
+		for i, name1 in enumerate(known_names):
+			if name1 in seen:
+				continue
+
+			group = [name1]
+			seen.add(name1)
+
+			for j, name2 in enumerate(known_names[i+1:], start=i+1):
+				if name2 in seen:
+					continue
+
+				# Check similarity
+				score = fuzz.ratio(name1, name2)
+				len_ratio = min(len(name1), len(name2)) / max(len(name1), len(name2))
+
+				if score >= threshold and len_ratio >= min_length_ratio:
+					group.append(name2)
+					seen.add(name2)
+
+			if len(group) > 1:
+				groups.append(group)
+
+		return groups

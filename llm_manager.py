@@ -526,8 +526,8 @@ class LLMManager:
 
 		# Match name markers properly:
 		name_marker_regex = re.compile(
-			rf"(?:\b(?P<valid>{valid_speaker_pattern}):\s*)"	# valid speakers anywhere
-			rf"|(?:\b(?P<guess>{valid_member_pattern}):\s*)"	# valid member names anywhere
+			rf"(?:^\s*(?P<valid>{valid_speaker_pattern}):\s*)"	# valid speakers anywhere
+			rf"|(?:^\s*(?P<guess>{valid_member_pattern}):\s*)"	# valid member names anywhere
 			rf"|(?:^\s*(?P<multi>\w+\s+\w+):\s*)"				# unknown multi-word markers ONLY if exactly 2 words at line start
 			rf"|(?:^\s*(?P<single>\w+):\s*)",					# unknown single-word markers only at line start
 			re.MULTILINE

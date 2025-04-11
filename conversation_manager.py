@@ -21,13 +21,13 @@ class ConversationManager:
 		self.max_batch_size				= int(config.get('Conversation Manager', 'MaxBatchSize', fallback='4'))
 		self.rpg_pairing_timeout		= float(config.get('Conversation Manager', 'RpgPairingTimeout', fallback='2.0'))
 
-		self.typing_min_speed				= int(config.get('Context Manager', 'TypingMinSpeed', fallback='50'))
-		self.typing_max_speed				= int(config.get('Context Manager', 'TypingMaxSpeed', fallback='150'))
+		self.typing_min_speed				= int(config.get('Context Manager', 'TypingMinSpeed', fallback='200'))
+		self.typing_max_speed				= int(config.get('Context Manager', 'TypingMaxSpeed', fallback='400'))
 		self.typing_hesitation_chance		= float(config.get('Context Manager', 'TypingHesitationSpeed', fallback='0.05'))
 		self.typing_hesitation_multiplier	= float(config.get('Context Manager', 'TypingHesitationMultiplier', fallback='2.0'))
 		self.typing_space_multiplier		= float(config.get('Context Manager', 'TypingSpaceMultiplier', fallback='0.5'))
-		self.thinking_min_delay				= float(config.get('Context Manager', 'ThinkingMinDelay', fallback='2.0'))
-		self.thinking_max_delay				= float(config.get('Context Manager', 'ThinkingMaxDelay', fallback='4.0'))
+		self.thinking_min_delay				= float(config.get('Context Manager', 'ThinkingMinDelay', fallback='3.0'))
+		self.thinking_max_delay				= float(config.get('Context Manager', 'ThinkingMaxDelay', fallback='5.0'))
 
 		self.conversation_queues = defaultdict(deque)			# Incoming requests per llm_channel
 		self.conversation_locks = defaultdict(threading.Lock)	# Per-channel locks
