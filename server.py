@@ -111,8 +111,9 @@ def generate_request():
 
 	if sender_type == "player":
 		conversation_manager.prioritize_player_message(llm_channel)
-		conversation_manager.unsuspend_queue(llm_channel)
-		debug_print(f"Allowed request from player <{sender_name}> and released channel {llm_channel} from suspension", color="cyan")
+		if conversation_manager.is_suspended(llm_channel):
+			conversation_manager.unsuspend_queue(llm_channel)
+			debug_print(f"Allowed request from player <{sender_name}> and released channel {llm_channel} from suspension", color="cyan")
 
 	else:
 		if conversation_manager.is_bot_busy(speaker_name):

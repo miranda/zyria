@@ -20,6 +20,7 @@ class ConversationManager:
 		self.fatigue_reset_time			= int(config.get('Conversation Manager', 'FatigueResetTime', fallback='30'))
 		self.max_batch_size				= int(config.get('Conversation Manager', 'MaxBatchSize', fallback='4'))
 		self.rpg_pairing_timeout		= float(config.get('Conversation Manager', 'RpgPairingTimeout', fallback='2.0'))
+		self.prioritization_cooldown	= int(config.get('Conversation Manager', 'PrioritizationCooldown', fallback='15'))
 
 		self.typing_min_speed				= int(config.get('Context Manager', 'TypingMinSpeed', fallback='200'))
 		self.typing_max_speed				= int(config.get('Context Manager', 'TypingMaxSpeed', fallback='400'))
@@ -43,7 +44,7 @@ class ConversationManager:
 		self.paused_queues = {}				# Tracks paused queues with timestamps
 		self.suspended_queues = {}			# Tracks suspended queues with timestamps
 		self.last_paused_data = {}			# Stores last time a queue was paused
-		self.last_paused_times = {}			# Stores last time a queue was paused
+		self.last_prioritized_times = {}	# Stores last time a player message was prioritized
 		self.sleeping_queues = {}			# Tracks queues in sleep mode 
 		self.sleep_thresholds = {}			# Stores random sleep message thresholds
 		self.last_request_time = {}			# Stores the last request timestamp per channel
@@ -300,7 +301,15 @@ class ConversationManager:
 			if not any(request.get("sender", {}).get("type") == "player" for request in queue):
 				return
 
-			debug_print(f"🎯 Player message detected in {llm_channel}! Prioritizing.", color="yellow")
+			now = time.time()
+			last_prioritized = self.last_prioritized_times.get(llm_channel, 0)
+
+			# If channel was recently prioritized, do nothing
+			if now - last_prioritized < self.prioritization_cooldown:
+				return
+
+			self.last_prioritized_times[llm_channel] = now	# Track prioritization time
+			debug_print(f"🎯 Prioritizing Player message in channel {llm_channel} by clearing eligible bot requests", color="yellow")
 
 			for request in queue:
 				if request.get("sender", {}).get("type") == "player":
@@ -317,8 +326,6 @@ class ConversationManager:
 
 					if target_speakers is None or any(speaker in target_speakers for speaker in speakers_involved):
 						self.cancel_request(request)
-
-			debug_print(f"Cleared relevant bot requests in {llm_channel} to prioritize player message.", color="yellow")
 
 	def adjust_response_delay_for_lag(self, key, llm_channel, response_delay, now, time_created):
 		"""removes lag from response delay for all related responses without harming response timings."""
@@ -482,7 +489,6 @@ class ConversationManager:
 			duration = min(duration, self.output_max_pause_time)
 			unpause_time = now + duration
 			self.paused_queues[llm_channel] = unpause_time
-			self.last_paused_times[llm_channel] = now  # Track last pause time
 
 			debug_print(f"⏸️ Paused channel {llm_channel} for {duration:.2f} seconds", color="red")
 			return True

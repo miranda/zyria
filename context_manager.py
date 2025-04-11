@@ -54,7 +54,7 @@ class ContextManager:
 		return next((v for k, v in expiration_map.items() if llm_channel.startswith(k)), self.world_expiration_time)
 
 	def add_message(self, llm_channel, speaker_name, message, response_delay):
-		"""Adds a message to the conversation history of the LLM channel, avoiding near-duplicate entries."""
+		"""Adds a message to the conversation history of the LLM channel, avoiding duplicate entries."""
 		now = time.time()
 
 		if llm_channel not in self.contexts:
@@ -64,29 +64,28 @@ class ContextManager:
 		lines = message.split("|")
 
 		with self.context_lock:
+			# Build a set of (speaker, text) pairs already in the context
+			existing_entries = {
+				(entry["name"], entry["text"]) for entry in self.contexts[llm_channel].values()
+			}
+
 			for line in lines:
+				# Parse [DELAY:x] and clean the line
 				next_delay_match = re.search(r"\[DELAY:(\d+)\]", line)
 				next_delay = int(next_delay_match.group(1)) / 1000 if next_delay_match else 0
 
 				line = re.sub(r"\[DELAY:\d+\]", "", line).strip()
 				timestamp = now + response_delay + this_delay
 
-				# Check for near-duplicates within ±3 seconds
-				nearby_start = timestamp - 3
-				nearby_end = timestamp + 3
-
-				is_duplicate = any(
-					nearby_start <= ts <= nearby_end and entry["name"] == speaker_name and entry["text"] == line
-					for ts, entry in self.contexts[llm_channel].items()
-				)
-
-				if not is_duplicate:
+				# Use content-based deduplication
+				if (speaker_name, line) in existing_entries:
+					debug_print(f"Skipped duplicate message from <{speaker_name}>: '{line}'", color="yellow")
+				else:
 					self.contexts[llm_channel][timestamp] = {
 						"name": speaker_name,
 						"text": line
 					}
-				else:
-					debug_print(f"Skipped duplicate message from <{speaker_name}>: '{line}'", color="yellow")
+					existing_entries.add((speaker_name, line))
 
 				this_delay += next_delay
 
