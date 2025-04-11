@@ -282,12 +282,14 @@ class Generator:
 		sender_names = list(unique_senders.keys())
 		speakers = list(unique_speakers.values())
 		speaker_names = list(unique_speakers.keys())
+		expedited = False
 
 		# Player messages must be added to the context here or they are lost forever
 		for stype, sname, msg, _ in new_messages:
 			if stype == "player":
 				debug_print(f"Adding player message \"{msg}\" from <{sname}> to context", color="yellow")
 				self.context_manager.add_message(llm_channel, sname, msg, 0)
+				expedited = True
 
 		# Cancel batch if only a single speaker self-reply remains
 		if (
@@ -330,7 +332,8 @@ class Generator:
 				"speaker_names": speaker_names,
 				"member_names": member_names,
 				"llm_channel": llm_channel,
-				"context": prompt_context
+				"context": prompt_context,
+				"expedited": expedited
 			},
 			"priority": 1,
 			"request_speaker_map": request_speaker_map

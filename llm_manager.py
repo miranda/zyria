@@ -307,7 +307,7 @@ class LLMManager:
 			if not dialogues or not speaker_order:
 				return self.cancel_responses(request_speaker_map, llm_channel, finish_reason="empty_response")
 
-			final_responses = self.apply_delays_to_dialogues(dialogues, speaker_order, request_speaker_map, message_type, llm_channel)
+			final_responses = self.apply_delays_to_dialogues(dialogues, speaker_order, prompt_data, request_speaker_map)
 			response_dict = {}
 
 			for request_id, response_data in final_responses.items():  # Unpack request_id and data
@@ -613,9 +613,15 @@ class LLMManager:
 
 		return dialogues, speaker_order
 
-	def apply_delays_to_dialogues(self, dialogues, speaker_order, request_speaker_map, message_type, llm_channel):
+	def apply_delays_to_dialogues(self, dialogues, speaker_order, prompt_data, request_speaker_map):
 		"""Applies response delays and embedded delay tags to dialogues, supporting RPG and non-RPG types."""
 		speaker_names = list(request_speaker_map.values())
+		message_type = prompt_data.get("message_type", "Unknown")
+		llm_channel = prompt_data.get("llm_channel", [])
+
+		if expedited := prompt_data.get("expedited", False):
+			debug_print("Bypassing thinking delays to expedite responses in batch", color="cyan")
+		thinking = not expedited
 		response_delays = {}
 
 		# Get the time received of the request for the first speaker's dialogue
@@ -655,7 +661,7 @@ class LLMManager:
 		else:
 			# Non-RPG style: first line gets full typing delay; gaps are based on typing delay or fixed rpg delay
 			first_line_typing_delay = (
-				self.conversation_manager.calculate_typing_delay(global_schedule[0]["line"], thinking=True)
+				self.conversation_manager.calculate_typing_delay(global_schedule[0]["line"], thinking=thinking)
 				if global_schedule else 0.0
 			)
 			debug_print(f"Calculated {first_line_typing_delay:.2f} seconds typing delay for first speaker <{speaker_order[0]}>", color="grey")
@@ -669,7 +675,7 @@ class LLMManager:
 				if i == 0:
 					entry["global_time"] = first_line_typing_delay
 				else:
-					gap = self.conversation_manager.calculate_typing_delay(entry["line"], thinking=True)
+					gap = self.conversation_manager.calculate_typing_delay(entry["line"], thinking=thinking)
 					entry["global_time"] = global_schedule[i - 1]["global_time"] + gap
 
 		# 3. Collect segment times per speaker
