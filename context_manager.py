@@ -8,6 +8,7 @@ import signal
 import json
 import os, sys
 import random
+from collections import deque
 
 SAVE_FILE = "context_restore.json"
 
@@ -21,12 +22,16 @@ class ContextManager:
 		self.guild_expiration_time		= int(config.get('Context Manager', 'GuildExpirationTime', fallback='1800'))
 		self.max_messages_per_channel	= int(config.get('Context Manager', 'MaxMessagesPerChannel', fallback='50'))
 		self.prune_interval				= int(config.get('Context Manager', 'PruneInterval', fallback='300'))
+		self.deduplicate_lines			= int(config.get('Context Manager', 'DeduplicateLines', fallback='15'))
 
 		self.contexts = {}			# Maps llm_channel -> SortedDict(timestamp -> message)
 		self.channel_members = {}	# Maps llm_channel -> set(names)
 		self.context_lock = threading.Lock()
 		self.restore_context()		# Restore context from last session
 		self.prune_context()		# Clear out stale context from last session
+
+		self.inserted_message_keys = {}		# llm_channel -> set
+		self.recent_key_order = {}			# llm_channel -> deque
 
 		# Start cleanup thread
 		self.prune_thread = threading.Thread(target=self._prune_loop, daemon=True)
@@ -60,32 +65,41 @@ class ContextManager:
 		if llm_channel not in self.contexts:
 			self.contexts[llm_channel] = SortedDict()
 
+		if llm_channel not in self.inserted_message_keys:
+			self.inserted_message_keys[llm_channel] = set()
+
+		if llm_channel not in self.recent_key_order:
+			self.recent_key_order[llm_channel] = deque()
+
 		this_delay = 0
 		lines = message.split("|")
 
 		with self.context_lock:
-			# Build a set of (speaker, text) pairs already in the context
-			existing_entries = {
-				(entry["name"], entry["text"]) for entry in self.contexts[llm_channel].values()
-			}
-
 			for line in lines:
-				# Parse [DELAY:x] and clean the line
+				# Parse and clean delay tag
 				next_delay_match = re.search(r"\[DELAY:(\d+)\]", line)
 				next_delay = int(next_delay_match.group(1)) / 1000 if next_delay_match else 0
 
 				line = re.sub(r"\[DELAY:\d+\]", "", line).strip()
 				timestamp = now + response_delay + this_delay
 
-				# Use content-based deduplication
-				if (speaker_name, line) in existing_entries:
+				key = (speaker_name, line)
+
+				if key in self.inserted_message_keys[llm_channel]:
 					debug_print(f"Skipped duplicate message from <{speaker_name}>: '{line}'", color="yellow")
 				else:
+					# Insert into context and track for deduplication
 					self.contexts[llm_channel][timestamp] = {
 						"name": speaker_name,
 						"text": line
 					}
-					existing_entries.add((speaker_name, line))
+					self.inserted_message_keys[llm_channel].add(key)
+					self.recent_key_order[llm_channel].append(key)
+
+					# Enforce limit
+					while len(self.recent_key_order[llm_channel]) > self.deduplicate_lines:
+						oldest = self.recent_key_order[llm_channel].popleft()
+						self.inserted_message_keys[llm_channel].discard(oldest)
 
 				this_delay += next_delay
 

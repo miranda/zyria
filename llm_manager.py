@@ -620,8 +620,7 @@ class LLMManager:
 		llm_channel = prompt_data.get("llm_channel", [])
 
 		if expedited := prompt_data.get("expedited", False):
-			debug_print("Bypassing thinking delays to expedite responses in batch", color="cyan")
-		thinking = not expedited
+			debug_print("Bypassing initial thinking delay to expedite responses in batch", color="cyan")
 		response_delays = {}
 
 		# Get the time received of the request for the first speaker's dialogue
@@ -661,7 +660,7 @@ class LLMManager:
 		else:
 			# Non-RPG style: first line gets full typing delay; gaps are based on typing delay or fixed rpg delay
 			first_line_typing_delay = (
-				self.conversation_manager.calculate_typing_delay(global_schedule[0]["line"], thinking=thinking)
+				self.conversation_manager.calculate_typing_delay(global_schedule[0]["line"], thinking=(not expedited))
 				if global_schedule else 0.0
 			)
 			debug_print(f"Calculated {first_line_typing_delay:.2f} seconds typing delay for first speaker <{speaker_order[0]}>", color="grey")
@@ -675,7 +674,7 @@ class LLMManager:
 				if i == 0:
 					entry["global_time"] = first_line_typing_delay
 				else:
-					gap = self.conversation_manager.calculate_typing_delay(entry["line"], thinking=thinking)
+					gap = self.conversation_manager.calculate_typing_delay(entry["line"], thinking=True)
 					entry["global_time"] = global_schedule[i - 1]["global_time"] + gap
 
 		# 3. Collect segment times per speaker
