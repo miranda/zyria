@@ -455,7 +455,7 @@ class ConversationManager:
 			# Calculate pause time
 			segments = response_text.split("|")
 			line = re.sub(r"\[DELAY:\d+\]", "", segments[0]).strip()
-			pause_time = remaining_pause + self.context_manager.calculate_typing_delay(line)
+			pause_time = remaining_pause + self.calculate_typing_delay(line)
 			pause_time = min(pause_time, self.output_max_pause_time)
 
 			# Generate a unique ID for this pause trigger

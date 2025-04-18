@@ -9,7 +9,6 @@ import traceback
 from log_utils import debug_print, logger
 from rapidfuzz import process, fuzz
 import nltk
-from nltk.corpus import words
 import unicodedata
 import itertools
 import time
@@ -41,7 +40,7 @@ class LLMManager:
 		self.logit_bias = self.tokenize_blocked_chars(self.blocked_tokens)
 			
 		# Load English words for dictionary check
-		self.english_words = set(words.words())
+		self.update_words()
 
 		# Set a maxsize of 100 for our priority queue.
 		self.queue = queue.PriorityQueue(maxsize=self.main_queue_size)	# Main queue
@@ -59,10 +58,14 @@ class LLMManager:
 		self.last_main_process_time = time.time()
 
 	def update_words(self):
+		import nltk
 		try:
 			nltk.data.find('corpora/words')
 		except LookupError:
 			nltk.download('words')
+
+		from nltk.corpus import words
+		self.english_words = set(words.words())
 
 	def tokenize(self, word):
 		if not isinstance(word, bytes):	 # Ensure conversion only if necessary
