@@ -43,10 +43,18 @@ cd zyria
 ## 2. Set Up a Python Virtual Environment
 
 Inside the Zyria directory:
+
+Linux/macOS:
 ```
 python3 -m venv venv
 source venv/bin/activate
 ```
+Windows (PowerShell or CMD):
+```
+python -m venv venv
+.\venv\Scripts\activate
+```
+If python3 doesn’t work, try python.
 
 ## 3. Install llama-cpp-python with GPU Support
 
